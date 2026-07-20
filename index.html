@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lake Map Coaster Creator</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='46' fill='%23a97b50'/%3E%3Cpath d='M38 25 C 34 40 40 55 37 72 C 43 74 46 60 44 45 C 42 35 44 28 38 25 Z' fill='%23402a18'/%3E%3C/svg%3E">
+</head>
+<body>
+<header class="app-header">
+  <h1>Lake Map Coaster Creator</h1>
+  <p class="tagline">Search any lake on Earth &rarr; export a laser-ready SVG coaster (xTool-friendly)</p>
+</header>
+
+<main class="layout">
+  <!-- ============ CONTROLS ============ -->
+  <aside class="controls">
+
+    <section class="panel" id="panel-lakes">
+      <h2>1 &middot; Lakes</h2>
+      <div class="search-row">
+        <input type="text" id="search-input" placeholder="e.g. Seneca Lake New York" autocomplete="off">
+        <button id="search-btn" class="btn">Search</button>
+      </div>
+      <div id="search-status" class="hint"></div>
+      <ul id="search-results" class="results-list"></ul>
+      <ul id="lake-list" class="lake-list"></ul>
+      <p class="hint">Search is powered by OpenStreetMap Nominatim (needs internet). Add as many lakes as you like &mdash; each gets its own small label.</p>
+    </section>
+
+    <section class="panel" id="panel-text">
+      <h2>2 &middot; Text</h2>
+      <label class="field">
+        <span>Top arc text (state / region)</span>
+        <input type="text" id="top-text" placeholder="New York">
+      </label>
+      <label class="field">
+        <span>Bottom arc text (title)</span>
+        <input type="text" id="bottom-text" placeholder="The Finger Lakes">
+      </label>
+      <label class="field slider-field">
+        <span>Arc text size <b id="arc-size-val"></b></span>
+        <input type="range" id="arc-size" min="4.5" max="12" step="0.1" value="7.2">
+      </label>
+      <label class="field slider-field">
+        <span>Arc letter spacing <b id="arc-spacing-val"></b></span>
+        <input type="range" id="arc-spacing" min="0" max="0.5" step="0.01" value="0.22">
+      </label>
+      <label class="field slider-field">
+        <span>Lake label size <b id="label-size-val"></b></span>
+        <input type="range" id="label-size" min="1.8" max="6" step="0.1" value="3.0">
+      </label>
+      <div id="text-warning" class="warn" hidden></div>
+    </section>
+
+    <section class="panel" id="panel-font">
+      <h2>3 &middot; Font</h2>
+      <div id="font-list" class="font-list"></div>
+    </section>
+
+    <section class="panel" id="panel-layout">
+      <h2>4 &middot; Layout</h2>
+      <label class="field slider-field">
+        <span>Map scale <b id="map-scale-val"></b></span>
+        <input type="range" id="map-scale" min="0.4" max="1.8" step="0.01" value="1">
+      </label>
+      <label class="field slider-field">
+        <span>Map rotation <b id="map-rot-val"></b></span>
+        <input type="range" id="map-rot" min="-180" max="180" step="1" value="0">
+      </label>
+      <div class="btn-row">
+        <button id="refit-btn" class="btn">Re-fit map</button>
+        <button id="autolabel-btn" class="btn">Auto-place labels</button>
+      </div>
+      <p class="hint">Drag the map to pan &middot; scroll to zoom &middot; drag labels to move them &middot; click a label to edit it.</p>
+      <div id="label-editor" class="label-editor" hidden>
+        <h3>Selected label</h3>
+        <label class="field"><span>Text</span><input type="text" id="lbl-text"></label>
+        <label class="field slider-field"><span>Size <b id="lbl-size-val"></b></span><input type="range" id="lbl-size" min="1.5" max="8" step="0.1"></label>
+        <label class="field slider-field"><span>Angle <b id="lbl-angle-val"></b></span><input type="range" id="lbl-angle" min="-180" max="180" step="1"></label>
+        <div class="btn-row">
+          <label class="check"><input type="checkbox" id="lbl-visible"> visible</label>
+          <button id="lbl-auto" class="btn small">Reset position</button>
+          <button id="lbl-close" class="btn small">Done</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-engrave">
+      <h2>5 &middot; Engraving</h2>
+      <label class="field num-field">
+        <span>Coaster diameter</span>
+        <span class="num-wrap"><input type="number" id="diameter" min="40" max="300" step="0.01" value="96.52"> mm</span>
+        <span class="hint-inline" id="diameter-in">= 3.80&Prime;</span>
+      </label>
+      <label class="check"><input type="checkbox" id="cut-circle" checked> include cut outline circle (red)</label>
+      <label class="field slider-field">
+        <span>Detail (simplify tolerance) <b id="detail-val"></b></span>
+        <input type="range" id="detail" min="0.02" max="0.30" step="0.01" value="0.08">
+      </label>
+      <label class="field slider-field">
+        <span>Minimum island size <b id="island-val"></b></span>
+        <input type="range" id="min-island" min="0" max="3" step="0.1" value="0.5">
+      </label>
+      <p class="hint">Everything black = engrave (fills, no strokes). Red circle = cut layer. All text is converted to vector paths, so it imports into xTool Creative Space with no font issues.</p>
+    </section>
+
+    <button id="export-btn" class="btn primary big">&#11015; Download SVG</button>
+    <div id="export-status" class="hint center"></div>
+  </aside>
+
+  <!-- ============ PREVIEW ============ -->
+  <section class="preview-wrap">
+    <div class="preview-frame">
+      <svg id="preview" viewBox="0 0 96.52 96.52" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+    <div class="preview-meta">
+      <span id="preview-size-note">3.8&Prime; (96.52 mm) round coaster</span>
+      <label class="check"><input type="checkbox" id="wood-style" checked> wood preview</label>
+    </div>
+  </section>
+</main>
+
+<footer class="app-footer">
+  Lake shapes &amp; search &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors (ODbL).
+  Fonts: Libre Baskerville, EB Garamond, Playfair Display, Montserrat (SIL OFL).
+</footer>
+
+<script src="js/vendor/opentype.min.js"></script>
+<script src="js/fonts-data.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

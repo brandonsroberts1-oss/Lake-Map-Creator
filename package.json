@@ -1,0 +1,14 @@
+{
+  "name": "lake-map-creator",
+  "version": "1.0.0",
+  "description": "Turn any lake on Earth into a laser-ready SVG coaster design",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8000",
+    "test": "node tools/e2e-test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.45.0"
+  }
+}
