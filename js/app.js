@@ -18,6 +18,7 @@ var STREET_COLOR = '#0000FF'; // separate layer: set to Score in XCS
 
 var OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter'
 ];
 var STREET_CATS = [
@@ -57,10 +58,13 @@ var state = {
   arcSpacing: 0.22,         // em letter spacing for arc text
   labelSize: 3.0,           // mm default label em size
   cutCircle: true,
-  detailTol: 0.08,          // mm simplify tolerance
+  smoothing: 0.6,           // 0..1 slider; see smoothSigma()
   minIsland: 0.5,           // mm^2 smallest kept island / ring
   woodPreview: true,
   selected: null,           // lake id whose label is being edited
+  scalebar: { on: false, x: null, y: null },
+  compass: { on: false, size: 16, x: null, y: null },
+  infobox: { on: false, scale: 1, x: null, y: null, depth: '', area: '' },
   streets: { loaded: false, ways: [], bbox: null }, // ways: {cat, pts[projected]}
   streetOpts: { enabled: false, major: true, main: true, local: true, minor: false, width: 0.2 },
   pins: [],                 // {id, px, py} in projected coords (track the map)
@@ -206,6 +210,87 @@ function simplifyRing(pts, tol) {
   return c1.slice(0, -1).concat(c2.slice(0, -1));
 }
 
+function ringPerimeter(pts) {
+  var p = 0;
+  for (var i = 0; i < pts.length; i++) {
+    var a = pts[i], b = pts[(i + 1) % pts.length];
+    p += Math.hypot(b[0] - a[0], b[1] - a[1]);
+  }
+  return p;
+}
+
+// Resample a closed ring at uniform arc-length spacing.
+function resampleClosed(pts, step) {
+  var per = ringPerimeter(pts);
+  var n = Math.max(12, Math.min(60000, Math.round(per / step)));
+  var target = per / n;
+  var out = [[pts[0][0], pts[0][1]]];
+  var i = 0, a = pts[0];
+  var remaining = target;
+  var guard = pts.length + n + 8;
+  while (out.length < n && guard-- > 0) {
+    var b = pts[(i + 1) % pts.length];
+    var seg = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (seg < 1e-12) { i++; a = b; continue; }
+    if (seg >= remaining) {
+      var t = remaining / seg;
+      a = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+      out.push(a);
+      remaining = target;
+    } else {
+      remaining -= seg;
+      i++;
+      a = b;
+    }
+  }
+  return out;
+}
+
+// Low-pass smooth a closed ring (circular Gaussian on x/y, sigma in mm,
+// assumes uniform spacing `step` between points).
+function gaussianClosed(pts, sigma, step) {
+  var n = pts.length;
+  if (sigma <= 0 || n < 8) return pts;
+  var k = Math.min(Math.max(1, Math.ceil(3 * sigma / step)), Math.floor(n / 2) - 1);
+  if (k < 1) return pts;
+  var w = [], sum = 0;
+  for (var j = -k; j <= k; j++) {
+    var g = Math.exp(-(j * j * step * step) / (2 * sigma * sigma));
+    w.push(g);
+    sum += g;
+  }
+  var out = new Array(n);
+  for (var i = 0; i < n; i++) {
+    var x = 0, y = 0;
+    for (var m = -k; m <= k; m++) {
+      var p = pts[(i + m + n) % n];
+      var g2 = w[m + k];
+      x += p[0] * g2;
+      y += p[1] * g2;
+    }
+    out[i] = [x / sum, y / sum];
+  }
+  return out;
+}
+
+// Full shoreline treatment: resample -> gaussian low-pass -> light DP.
+// Slider maps non-linearly so the low end stays subtle and the top end can
+// genuinely melt fjord-y noise (sigma up to 2.5 mm on the coaster).
+function smoothSigma() {
+  var v = state.smoothing;
+  return v <= 0 ? 0 : 4.2 * Math.pow(v, 1.4);
+}
+function smoothRing(ptsMM) {
+  var sigma = smoothSigma();
+  if (sigma <= 0.02) return simplifyRing(ptsMM, 0.05);
+  var per = ringPerimeter(ptsMM);
+  if (per < 2) return ptsMM;
+  var step = Math.min(0.35, Math.max(0.12, sigma / 3));
+  var r = resampleClosed(ptsMM, step);
+  r = gaussianClosed(r, sigma, step);
+  return simplifyRing(r, 0.03);
+}
+
 /* ------------------------------------------------------------
  * View transform: projected coords -> coaster mm
  * ---------------------------------------------------------- */
@@ -252,7 +337,16 @@ function arcBand(side) {
   return { inner: inner, halfAng: halfAng, centerAng: side === 'top' ? -Math.PI / 2 : Math.PI / 2 };
 }
 
-function pointAllowed(x, y, D, bands) {
+function pointInPoly(x, y, poly) {
+  var inside = false;
+  for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    var xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function pointAllowed(x, y, D, bands, keepout) {
   var c = D / 2;
   var dx = x - c, dy = y - c;
   var r = Math.hypot(dx, dy);
@@ -263,6 +357,15 @@ function pointAllowed(x, y, D, bands) {
     var da = Math.abs(Math.atan2(dy, dx) - b.centerAng);
     if (da > Math.PI) da = 2 * Math.PI - da;
     if (da <= b.halfAng) return false;
+  }
+  if (keepout) {
+    for (var k = 0; k < keepout.discs.length; k++) {
+      var dsc = keepout.discs[k];
+      if (Math.hypot(x - dsc.x, y - dsc.y) < dsc.r) return false;
+    }
+    for (var p = 0; p < keepout.polys.length; p++) {
+      if (pointInPoly(x, y, keepout.polys[p])) return false;
+    }
   }
   return true;
 }
@@ -322,7 +425,7 @@ var geomCache = {};
 
 function lakeRingsMM(lake) {
   var key = [state.view.baseScale, state.view.scaleMul, state.view.rotDeg,
-             state.detailTol, state.minIsland, state.diameter,
+             state.smoothing, state.minIsland, state.diameter,
              state.topText.trim() ? 1 : 0, state.bottomText.trim() ? 1 : 0].join('|');
   var hit = geomCache[lake.id];
   if (hit && hit.key === key) return hit.rings;
@@ -330,11 +433,11 @@ function lakeRingsMM(lake) {
   var m = viewMatrix(false);
   var polys = [];
   lake.polys.forEach(function (poly) {
-    var outer = simplifyRing(poly.outer.map(function (p) { return applyM(m, p); }), state.detailTol);
+    var outer = smoothRing(poly.outer.map(function (p) { return applyM(m, p); }));
     if (outer.length < 3) return;
     var holes = [];
     poly.holes.forEach(function (hr) {
-      var h = simplifyRing(hr.map(function (p) { return applyM(m, p); }), state.detailTol);
+      var h = smoothRing(hr.map(function (p) { return applyM(m, p); }));
       if (h.length >= 3 && Math.abs(signedArea(h)) >= state.minIsland) holes.push(h);
     });
     polys.push({ outer: outer, holes: holes, area: Math.abs(signedArea(outer)) });
@@ -354,19 +457,60 @@ function lakeRingsMM(lake) {
   return polys;
 }
 
-function lakePathD(lake) {
-  var polys = lakeRingsMM(lake);
-  var tx = state.view.tx, ty = state.view.ty;
+// Rounded-rect polygon (for boolean clipping), centered at origin, then
+// transformed by affine m.
+function roundedRectPoly(w, h, r, m) {
+  var hw = w / 2, hh = h / 2;
+  r = Math.max(0, Math.min(r, hw, hh));
+  var segs = 6, pts = [];
+  var corners = [
+    [hw - r, hh - r, 0], [-hw + r, hh - r, Math.PI / 2],
+    [-hw + r, -hh + r, Math.PI], [hw - r, -hh + r, 3 * Math.PI / 2]
+  ];
+  corners.forEach(function (c) {
+    for (var i = 0; i <= segs; i++) {
+      var a = c[2] + i / segs * Math.PI / 2;
+      pts.push(applyM(m, [c[0] + r * Math.cos(a), c[1] + r * Math.sin(a)]));
+    }
+  });
+  pts.push(pts[0].slice());
+  return pts;
+}
+
+function ringsToPathD(mp) {
   var d = '';
-  polys.forEach(function (poly) {
-    [poly.outer].concat(poly.holes).forEach(function (ring) {
-      for (var i = 0; i < ring.length; i++) {
-        d += (i === 0 ? 'M' : 'L') + fmt(ring[i][0] + tx) + ' ' + fmt(ring[i][1] + ty);
+  mp.forEach(function (poly) {
+    poly.forEach(function (ring) {
+      var n = ring.length;
+      // skip duplicated closing point
+      if (n > 1 && ring[0][0] === ring[n - 1][0] && ring[0][1] === ring[n - 1][1]) n--;
+      for (var i = 0; i < n; i++) {
+        d += (i === 0 ? 'M' : 'L') + fmt(ring[i][0]) + ' ' + fmt(ring[i][1]);
       }
       d += 'Z';
     });
   });
   return d;
+}
+
+// Lake path with optional knockout windows subtracted via true boolean ops
+// (a window that pokes past the shoreline must NOT fill outside the lake).
+function lakePathD(lake, windows) {
+  var polys = lakeRingsMM(lake);
+  var tx = state.view.tx, ty = state.view.ty;
+  var mp = polys.map(function (p) {
+    return [p.outer.map(function (q) { return [q[0] + tx, q[1] + ty]; })]
+      .concat(p.holes.map(function (h) {
+        return h.map(function (q) { return [q[0] + tx, q[1] + ty]; });
+      }));
+  });
+  if (windows && windows.length && window.polygonClipping) {
+    try {
+      var args = [mp].concat(windows.map(function (w) { return [w]; }));
+      mp = polygonClipping.difference.apply(null, args);
+    } catch (e) { /* keep unclipped geometry on numeric failure */ }
+  }
+  return ringsToPathD(mp);
 }
 
 // centroid + PCA axis of a lake in current mm space (pan included)
@@ -406,6 +550,7 @@ function lakeStatsMM(lake) {
     cx: mx + tx, cy: my + ty,
     ex: ex, ey: ey,
     halfLen: (maxA - minA) / 2, halfWid: (maxP - minP) / 2,
+    minP: minP, maxP: maxP,
     elong: Math.sqrt(Math.max(l1, 1e-12) / Math.max(l2, 1e-12))
   };
 }
@@ -426,14 +571,49 @@ function autoPlaceLabel(lake) {
   }
   lbl.angle = st.elong < 1.25 ? 0 : Math.round(ang);
   var size = lbl.size || state.labelSize;
-  var off = st.halfWid + size * 0.75 + 1.0;
   var px = -st.ey, py = st.ex; // perpendicular
   var D = state.diameter, c = D / 2;
-  var c1 = [st.cx + px * off, st.cy + py * off];
-  var c2 = [st.cx - px * off, st.cy - py * off];
-  var d1 = Math.hypot(c1[0] - c, c1[1] - c);
-  var d2 = Math.hypot(c2[0] - c, c2[1] - c);
-  var pick = d1 <= d2 ? c1 : c2;
+
+  // score candidate spots on both sides at increasing offsets, sampling
+  // points along the label's length: never sit on the lake fill (black on
+  // black), stay inside the disc, stay close
+  var font = currentFont();
+  var w = font ? font.getAdvanceWidth(lbl.text || 'Lake', size, { kerning: true }) : 12;
+  var outer = null, bestA = 0;
+  lakeRingsMM(lake).forEach(function (p) {
+    if (p.area > bestA) { bestA = p.area; outer = p.outer; }
+  });
+  var tx = state.view.tx, ty = state.view.ty;
+  // sample the label body: 5 points along its length on 2 lines spanning
+  // its height, so glyph tops/bottoms are respected too
+  function insideCount(qx, qy) {
+    if (!outer) return 0;
+    var cnt = 0;
+    for (var k = -2; k <= 2; k++) {
+      for (var h = -1; h <= 1; h += 2) {
+        var sx = qx + st.ex * (w / 2) * (k / 2) + px * size * 0.55 * h;
+        var sy = qy + st.ey * (w / 2) * (k / 2) + py * size * 0.55 * h;
+        if (pointInPoly(sx - tx, sy - ty, outer)) cnt++;
+      }
+    }
+    return cnt;
+  }
+  var pick = null, bestScore = Infinity;
+  [1, -1].forEach(function (side) {
+    // measure from the lake's actual extent on that side, not the average
+    var base = (side > 0 ? st.maxP : -st.minP) + size * 0.9 + 1.0;
+    for (var k = 0; k < 4; k++) {
+      [0, -0.3, 0.3].forEach(function (slide) {
+        var o = base + k * 2.0;
+        var q = [st.cx + px * side * o + st.ex * st.halfLen * slide,
+                 st.cy + py * side * o + st.ey * st.halfLen * slide];
+        var r = Math.hypot(q[0] - c, q[1] - c);
+        var score = insideCount(q[0], q[1]) * 10 + k * 1.5 + Math.abs(slide) * 2 +
+          Math.max(0, r - (c - EDGE_MARGIN - 3)) * 12 + r * 0.02;
+        if (score < bestScore) { bestScore = score; pick = q; }
+      });
+    }
+  });
   lbl.dx = pick[0] - st.cx;
   lbl.dy = pick[1] - st.cy;
 }
@@ -441,9 +621,11 @@ function autoPlaceLabel(lake) {
 /* ------------------------------------------------------------
  * Streets (OpenStreetMap Overpass)
  * ---------------------------------------------------------- */
-function streetStatus(msg) {
+function streetStatus(msg, isWarn) {
   var el = $('streets-status');
-  if (el) el.textContent = msg || '';
+  if (!el) return;
+  el.textContent = msg || '';
+  el.className = isWarn ? 'warn' : 'hint';
 }
 
 // Overpass "way" elements (with .tags.highway and .geometry) -> state.streets
@@ -471,41 +653,60 @@ function applyStreetElements(elements, bb) {
   render();
 }
 
+var streetsLoading = false;
 function fetchStreets() {
-  if (!state.lakes.length) { streetStatus('Add a lake first, then load streets.'); return; }
+  if (streetsLoading) return;
+  if (!state.lakes.length) { streetStatus('Add a lake first, then load streets.', true); return; }
   var bb = visibleLonLatBBox(1.06);
   var midLat = (bb.n + bb.s) / 2;
   var span = Math.max(bb.n - bb.s, (bb.e - bb.w) * Math.cos(deg2rad(midLat)));
-  if (span > 0.6) {
-    streetStatus('This view covers too much area for street data (' + span.toFixed(2) +
-      '°). Streets are meant for a single small lake — zoom in first.');
+  if (span > 0.7) {
+    streetStatus('This view covers too much land for street data (~' +
+      Math.round(span * 69) + ' miles across). Streets are for a single small lake — ' +
+      'they can’t load for something the size of a Great Lake.', true);
     return;
   }
-  streetStatus('Loading streets from OpenStreetMap…');
+  streetsLoading = true;
   var re = 'motorway|trunk|primary|secondary|tertiary|residential|unclassified|living_street|pedestrian|road|service|track|cycleway|footway|path|bridleway|steps';
-  var q = '[out:json][timeout:30];way["highway"~"^(' + re + ')(_link)?$"](' +
+  var q = '[out:json][timeout:40];way["highway"~"^(' + re + ')(_link)?$"](' +
     [bb.s, bb.w, bb.n, bb.e].join(',') + ');out geom qt;';
   (function tryEndpoint(i) {
+    var host = OVERPASS_ENDPOINTS[i].replace(/^https:\/\//, '').split('/')[0];
+    streetStatus('Loading streets from OpenStreetMap (' + host +
+      (i ? ', mirror ' + (i + 1) : '') + ')… this can take up to a minute.');
+    var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timer = ctrl && setTimeout(function () { ctrl.abort(); }, 45000);
     fetch(OVERPASS_ENDPOINTS[i], {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'data=' + encodeURIComponent(q)
+      body: 'data=' + encodeURIComponent(q),
+      signal: ctrl ? ctrl.signal : undefined
     }).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     }).then(function (json) {
+      if (timer) clearTimeout(timer);
+      streetsLoading = false;
       applyStreetElements(json.elements || [], bb);
     }).catch(function (err) {
-      if (i + 1 < OVERPASS_ENDPOINTS.length) tryEndpoint(i + 1);
-      else streetStatus('Street data failed to load (' + (err.message || err) +
-        '). Overpass may be busy — try again in a minute.');
+      if (timer) clearTimeout(timer);
+      var why = err && err.name === 'AbortError' ? 'timed out' : String(err.message || err);
+      console.warn('Overpass ' + host + ' failed: ' + why);
+      if (i + 1 < OVERPASS_ENDPOINTS.length) {
+        tryEndpoint(i + 1);
+      } else {
+        streetsLoading = false;
+        streetStatus('Street data failed on all servers (last: ' + why +
+          '). Overpass gets busy — wait a minute and press “Load streets” again.', true);
+      }
     });
   })(0);
 }
 
-// Split a polyline into runs inside the allowed disc (rim margin + arc bands),
-// with bisection-refined boundary points. Long segments are subdivided first.
-function clipRuns(pts, D, bands) {
+// Split a polyline into runs inside the allowed disc (rim margin + arc bands
+// + keep-out shapes), with bisection-refined boundary points. Long segments
+// are subdivided first.
+function clipRuns(pts, D, bands, keepout) {
   var sub = [];
   for (var i = 0; i < pts.length; i++) {
     if (i) {
@@ -521,14 +722,14 @@ function clipRuns(pts, D, bands) {
     var a = out, b = ins;
     for (var j = 0; j < 8; j++) {
       var mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-      if (pointAllowed(mid[0], mid[1], D, bands)) b = mid; else a = mid;
+      if (pointAllowed(mid[0], mid[1], D, bands, keepout)) b = mid; else a = mid;
     }
     return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
   }
   var runs = [], cur = null, prev = null, prevOk = false;
   for (var m = 0; m < sub.length; m++) {
     var p = sub[m];
-    var ok = pointAllowed(p[0], p[1], D, bands);
+    var ok = pointAllowed(p[0], p[1], D, bands, keepout);
     if (ok) {
       if (!cur) {
         cur = [];
@@ -546,8 +747,9 @@ function clipRuns(pts, D, bands) {
   return runs;
 }
 
-// -> [{cat, d}] for currently enabled street categories, clipped & simplified
-function streetPaths() {
+// -> [{cat, d}] for currently enabled street categories, clipped & simplified.
+// keepout: {polys:[], discs:[]} — text windows, compass, scale bar.
+function streetPaths(keepout) {
   var o = state.streetOpts;
   if (!o.enabled || !state.streets.loaded || !state.streets.ways.length) return [];
   var m = viewMatrix(true);
@@ -557,7 +759,7 @@ function streetPaths() {
   state.streets.ways.forEach(function (w) {
     if (!o[w.cat]) return;
     var mm = w.pts.map(function (p) { return applyM(m, p); });
-    clipRuns(mm, D, bands).forEach(function (run) {
+    clipRuns(mm, D, bands, keepout).forEach(function (run) {
       run = dpChain(run, state.detailTol * 0.6);
       if (run.length < 2) return;
       var len = 0;
@@ -759,62 +961,301 @@ function missingChars(font, text) {
 }
 
 /* ------------------------------------------------------------
+ * Map extras: scale bar, compass rose, info box
+ * ---------------------------------------------------------- */
+function groundMetersPerMM() {
+  var s = state.view.baseScale * state.view.scaleMul;
+  if (!s || !state.lakes.length) return null;
+  var c = state.diameter / 2;
+  var ll = unproject(invViewPoint(c, c));
+  return Math.cos(deg2rad(ll[1])) / s;
+}
+
+// pick a round mile (or feet) length whose bar is ~14–30 mm on the coaster
+function niceScaleBar(mPerMM) {
+  var MI = 1609.344, FT = 0.3048;
+  var mi = [0.1, 0.2, 0.25, 0.5, 1, 2, 3, 5, 10, 15, 20, 25, 40, 50, 100, 150, 200, 300];
+  var best = null;
+  mi.forEach(function (v) {
+    var len = v * MI / mPerMM;
+    if (len < 12 || len > 32) return;
+    if (!best || Math.abs(len - 20) < Math.abs(best.len - 20)) {
+      best = { len: len, label: (v >= 1 ? String(v) : String(v)) + ' mi' };
+    }
+  });
+  if (!best) {
+    [100, 200, 250, 500, 1000, 1500, 2000].forEach(function (v) {
+      var len = v * FT / mPerMM;
+      if (len < 12 || len > 32) return;
+      if (!best || Math.abs(len - 20) < Math.abs(best.len - 20)) {
+        best = { len: len, label: v + ' ft' };
+      }
+    });
+  }
+  return best;
+}
+
+function rectD(cx, cy, w, h) {
+  return commandsToD(roundedRectCmds(w, h, 0, 1), [1, 0, 0, 1, cx, cy]);
+}
+
+function buildScalebarArt(art, font) {
+  if (!state.scalebar.on) return;
+  var mPerMM = groundMetersPerMM();
+  if (!mPerMM) return;
+  var bar = niceScaleBar(mPerMM);
+  if (!bar) return;
+  var D = state.diameter;
+  var x = state.scalebar.x == null ? D * 0.30 : state.scalebar.x;
+  var y = state.scalebar.y == null ? D * 0.705 : state.scalebar.y;
+  var len = bar.len, bh = 0.42, th = 1.9;
+  var d = rectD(x, y, len, bh) +
+          rectD(x - len / 2 + bh / 2, y - th / 2 + bh / 2, bh, th) +
+          rectD(x + len / 2 - bh / 2, y - th / 2 + bh / 2, bh, th) +
+          rectD(x, y - th * 0.32 + bh / 2, bh * 0.8, th * 0.64) +
+          straightTextD(font, bar.label, 2.3, x, y - th - 1.6, 0);
+  art.scalebar = { d: d, x: x, y: y, hitHW: len / 2 + 2.5, hitHH: 5.5 };
+}
+
+// 8-point nautical rose: two overlaid 4-point stars + ring + center dot + N
+function star4Poly(outerR, innerR, phaseDeg, m) {
+  var pts = [];
+  for (var i = 0; i < 8; i++) {
+    var r = i % 2 === 0 ? outerR : innerR;
+    var a = deg2rad(phaseDeg + i * 45 - 90);
+    pts.push(applyM(m, [r * Math.cos(a), r * Math.sin(a)]));
+  }
+  return pts;
+}
+function polyCmdsD(pts) {
+  var d = '';
+  for (var i = 0; i < pts.length; i++) {
+    d += (i === 0 ? 'M' : 'L') + fmt(pts[i][0]) + ' ' + fmt(pts[i][1]);
+  }
+  return d + 'Z';
+}
+
+function buildCompassArt(art, font) {
+  var cp = state.compass;
+  if (!cp.on) return;
+  var D = state.diameter;
+  var x = cp.x == null ? D * 0.76 : cp.x;
+  var y = cp.y == null ? D * 0.40 : cp.y;
+  var R = cp.size / 2;
+  var rot = deg2rad(state.view.rotDeg);
+  var m = [Math.cos(rot), Math.sin(rot), -Math.sin(rot), Math.cos(rot), x, y];
+  var d = '';
+  // ring (band works in either fill rule via opposite winding)
+  d += commandsToD(circleCmds(0, 0, R * 0.55, 1), m);
+  d += commandsToD(circleCmds(0, 0, R * 0.505, -1), m);
+  // ordinal star under cardinal star
+  d += polyCmdsD(star4Poly(R * 0.62, R * 0.16, 45, m));
+  d += polyCmdsD(star4Poly(R, R * 0.20, 0, m));
+  d += commandsToD(circleCmds(0, 0, R * 0.07, 1), m);
+  // N above the north point, rotating with the rose (true north)
+  var ns = Math.min(4.2, Math.max(1.7, R * 0.32));
+  var nPos = applyM(m, [0, -(R + ns * 0.72)]);
+  d += straightTextD(font, 'N', ns, nPos[0], nPos[1], state.view.rotDeg);
+  art.compass = { d: d, x: x, y: y, hitR: R + ns * 1.6 };
+}
+
+/* ---- info box (single-lake) ---- */
+function lakeCentroidLL(lake) {
+  var sx = 0, sy = 0, n = 0;
+  var best = lake.polys.reduce(function (a, p) {
+    return !a || Math.abs(signedArea(p.outer)) > Math.abs(signedArea(a.outer)) ? p : a;
+  }, null);
+  if (!best) return null;
+  best.outer.forEach(function (q) { sx += q[0]; sy += q[1]; n++; });
+  return unproject([sx / n, sy / n]);
+}
+function formatLatLon(ll) {
+  if (!ll) return '';
+  var lat = ll[1], lon = ll[0];
+  return Math.abs(lat).toFixed(2) + '° ' + (lat >= 0 ? 'N' : 'S') + ',  ' +
+         Math.abs(lon).toFixed(2) + '° ' + (lon >= 0 ? 'E' : 'W');
+}
+function lakeAreaMi2(lake) {
+  var m2 = 0;
+  lake.polys.forEach(function (p) {
+    m2 += Math.abs(signedArea(p.outer));
+    p.holes.forEach(function (h) { m2 -= Math.abs(signedArea(h)); });
+  });
+  var ll = lakeCentroidLL(lake);
+  if (!ll) return null;
+  var k = Math.cos(deg2rad(ll[1]));
+  return m2 * k * k / 2589988.110336;
+}
+function formatAreaMi2(a) {
+  if (a == null || !isFinite(a)) return '';
+  var s;
+  if (a >= 1000) s = Math.round(a).toLocaleString('en-US');
+  else if (a >= 100) s = String(Math.round(a));
+  else if (a >= 10) s = a.toFixed(1);
+  else s = a.toFixed(2);
+  return s + ' sq mi';
+}
+
+// simple anchor silhouette (height h, centered on 0,0), sampled arcs
+function anchorD(h, cx, cy) {
+  var s = h, d = '';
+  var m = [1, 0, 0, 1, cx, cy];
+  // ring at top
+  d += commandsToD(circleCmds(0, -0.40 * s, 0.105 * s, 1), m);
+  d += commandsToD(circleCmds(0, -0.40 * s, 0.058 * s, -1), m);
+  // shank + stock
+  d += rectD(cx, cy - 0.015 * s, 0.06 * s, 0.60 * s);
+  d += rectD(cx, cy - 0.235 * s, 0.40 * s, 0.055 * s);
+  // bottom crescent (half-annulus opening upward), sampled polygon
+  var rO = 0.30 * s, rI = 0.20 * s, a0 = deg2rad(195), a1 = deg2rad(-15), pts = [];
+  for (var i = 0; i <= 16; i++) {
+    var a = a0 + (a1 - a0) * i / 16;
+    pts.push(applyM(m, [rO * Math.cos(a), 0.12 * s - rO * Math.sin(a)]));
+  }
+  for (var j = 16; j >= 0; j--) {
+    var b = a0 + (a1 - a0) * j / 16;
+    pts.push(applyM(m, [rI * Math.cos(b), 0.12 * s - rI * Math.sin(b)]));
+  }
+  d += polyCmdsD(pts);
+  return d;
+}
+
+function buildInfoboxArt(art, windowsByLake, font) {
+  var ib = state.infobox;
+  if (!ib.on || state.lakes.length !== 1) return;
+  var lake = state.lakes[0];
+  var f = ib.scale;
+  var name = (lake.name || 'Lake').toUpperCase();
+  var lines = [];
+  if (lake.region) lines.push(lake.region);
+  var ll = lakeCentroidLL(lake);
+  if (ll) lines.push(formatLatLon(ll));
+  if (ib.depth.trim()) lines.push('Max Depth: ' + ib.depth.trim());
+  if (ib.area.trim()) lines.push('Area: ' + ib.area.trim());
+
+  var sName = 2.9 * f, sLine = 2.05 * f;
+  var wMax = font.getAdvanceWidth(name, sName, { kerning: true });
+  lines.forEach(function (t) {
+    wMax = Math.max(wMax, font.getAdvanceWidth(t, sLine, { kerning: true }));
+  });
+  var anchorH = 3.1 * f;
+  var lineGap = sLine * 1.52;
+  var padX = 2.6 * f, padY = 2.0 * f;
+  var boxW = wMax + padX * 2;
+  var boxH = padY * 2 + anchorH + 1.2 * f + sName + 0.9 * f + lines.length * lineGap;
+
+  var D = state.diameter;
+  var x = ib.x, y = ib.y;
+  if (x == null || y == null) {
+    // default: the quadrant farthest from the lake body
+    var st = lakeStatsMM(lake);
+    var c = D / 2;
+    var cands = [
+      [D * 0.30, D * 0.36], [D * 0.70, D * 0.36],
+      [D * 0.30, D * 0.66], [D * 0.70, D * 0.66], [c, D * 0.68]
+    ];
+    var best = cands[4], bestScore = -1;
+    cands.forEach(function (q) {
+      var score = st ? Math.hypot(q[0] - st.cx, q[1] - st.cy) : Math.hypot(q[0] - c, q[1] - c);
+      if (score > bestScore) { bestScore = score; best = q; }
+    });
+    x = Math.min(Math.max(best[0], boxW / 2 + 5), D - boxW / 2 - 5);
+    y = Math.min(Math.max(best[1], boxH / 2 + 13), D - boxH / 2 - 13);
+  }
+
+  var m = [1, 0, 0, 1, x, y];
+  var d = '';
+  // double nautical border
+  d += commandsToD(roundedRectCmds(boxW, boxH, 1.8 * f, 1), m);
+  d += commandsToD(roundedRectCmds(boxW - 0.5 * f, boxH - 0.5 * f, 1.55 * f, -1), m);
+  d += commandsToD(roundedRectCmds(boxW - 1.5 * f, boxH - 1.5 * f, 1.2 * f, 1), m);
+  d += commandsToD(roundedRectCmds(boxW - 1.78 * f, boxH - 1.78 * f, 1.06 * f, -1), m);
+
+  var cy = -boxH / 2 + padY + anchorH / 2;
+  d += anchorD(anchorH, x, y + cy);
+  cy += anchorH / 2 + 1.2 * f + sName / 2;
+  d += straightTextD(font, name, sName, x, y + cy, 0);
+  cy += sName / 2 + 0.9 * f + lineGap / 2;
+  lines.forEach(function (t) {
+    d += straightTextD(font, t, sLine, x, y + cy, 0);
+    cy += lineGap;
+  });
+
+  // knock the box (plus margin) out of the lake fill if they overlap
+  var win = roundedRectPoly(boxW + 1.1, boxH + 1.1, 2.1 * f, m);
+  (windowsByLake[lake.id] = windowsByLake[lake.id] || []).push(win);
+
+  art.infobox = { d: d, x: x, y: y, hitHW: boxW / 2 + 1, hitHH: boxH / 2 + 1 };
+}
+
+/* ------------------------------------------------------------
  * Build all artwork pieces (shared by preview & export)
  * ---------------------------------------------------------- */
 function buildArt() {
   var D = state.diameter, c = D / 2;
   var font = currentFont();
-  var art = { lakes: [], labels: [], arcs: [], streets: [], pins: [], cut: null, warnings: [] };
+  var art = { lakes: [], labels: [], arcs: [], streets: [], pins: [],
+              scalebar: null, compass: null, infobox: null, cut: null, warnings: [] };
   if (!font) return art;
 
+  // pass 1: labels (collecting knockout windows per lake)
+  var windowsByLake = {};
+  var labelKeepouts = [];
   state.lakes.forEach(function (lake) {
-    var d = lakePathD(lake);
     var lbl = lake.label;
-    if (lbl.visible && lbl.text.trim()) {
-      var st = lakeStatsMM(lake);
-      if (st) {
-        var size = lbl.size || state.labelSize;
-        var cx = st.cx + lbl.dx, cy = st.cy + lbl.dy;
-        var ld = straightTextD(font, lbl.text, size, cx, cy, lbl.angle);
-        if (ld) {
-          var entry = {
-            id: lake.id, d: ld, cx: cx, cy: cy,
-            angle: lbl.angle, size: size, boxed: !!lbl.boxed,
-            w: font.getAdvanceWidth(lbl.text, size, { kerning: true })
-          };
-          if (lbl.boxed) {
-            // rounded text box reversed out of the lake fill:
-            // window (hole in lake) > engraved border band > text
-            var cap = capHeightMM(font, size);
-            var r = deg2rad(lbl.angle);
-            var mtx = [Math.cos(r), Math.sin(r), -Math.sin(r), Math.cos(r), cx, cy];
-            var bandW = Math.max(0.28, size * 0.09);
-            var gap = Math.max(0.45, size * 0.14);
-            var inHW = entry.w / 2 + 0.55 * size + 0.4;
-            var inHH = cap / 2 + 0.42 * size + 0.3;
-            var rIn = Math.min(1.4, inHH * 0.5);
-            entry.d = ld +
-              commandsToD(roundedRectCmds((inHW + bandW) * 2, (inHH + bandW) * 2, rIn + bandW, 1), mtx) +
-              commandsToD(roundedRectCmds(inHW * 2, inHH * 2, rIn, -1), mtx);
-            entry.hitHW = inHW + bandW + gap;
-            entry.hitHH = inHH + bandW + gap;
-            // knockout window in the lake fill (opposite winding to outer rings)
-            d += commandsToD(roundedRectCmds((inHW + bandW + gap) * 2, (inHH + bandW + gap) * 2,
-              rIn + bandW + gap, -1), mtx);
-          } else {
-            entry.hitHW = entry.w / 2 + 1.2;
-            entry.hitHH = size * 0.85 + 0.8;
-          }
-          art.labels.push(entry);
+    if (!lbl.visible || !lbl.text.trim()) return;
+    var st = lakeStatsMM(lake);
+    if (st) {
+      var size = lbl.size || state.labelSize;
+      var cx = st.cx + lbl.dx, cy = st.cy + lbl.dy;
+      var ld = straightTextD(font, lbl.text, size, cx, cy, lbl.angle);
+      if (ld) {
+        var entry = {
+          id: lake.id, d: ld, cx: cx, cy: cy,
+          angle: lbl.angle, size: size, boxed: !!lbl.boxed,
+          w: font.getAdvanceWidth(lbl.text, size, { kerning: true })
+        };
+        if (lbl.boxed) {
+          // rounded text box reversed out of the lake fill:
+          // window (hole in lake) > engraved border band > text
+          var cap = capHeightMM(font, size);
+          var r = deg2rad(lbl.angle);
+          var mtx = [Math.cos(r), Math.sin(r), -Math.sin(r), Math.cos(r), cx, cy];
+          var bandW = Math.max(0.28, size * 0.09);
+          var gap = Math.max(0.45, size * 0.14);
+          var inHW = entry.w / 2 + 0.55 * size + 0.4;
+          var inHH = cap / 2 + 0.42 * size + 0.3;
+          var rIn = Math.min(1.4, inHH * 0.5);
+          entry.d = ld +
+            commandsToD(roundedRectCmds((inHW + bandW) * 2, (inHH + bandW) * 2, rIn + bandW, 1), mtx) +
+            commandsToD(roundedRectCmds(inHW * 2, inHH * 2, rIn, -1), mtx);
+          entry.hitHW = inHW + bandW + gap;
+          entry.hitHH = inHH + bandW + gap;
+          (windowsByLake[lake.id] = windowsByLake[lake.id] || []).push(
+            roundedRectPoly((inHW + bandW + gap) * 2, (inHH + bandW + gap) * 2, rIn + bandW + gap, mtx));
+        } else {
+          entry.hitHW = entry.w / 2 + 1.2;
+          entry.hitHH = size * 0.85 + 0.8;
+          // streets stay out from under floating labels for readability
+          var lr = deg2rad(entry.angle);
+          labelKeepouts.push(roundedRectPoly(entry.hitHW * 2, entry.hitHH * 2, 0.8,
+            [Math.cos(lr), Math.sin(lr), -Math.sin(lr), Math.cos(lr), cx, cy]));
         }
+        art.labels.push(entry);
       }
-      var miss = missingChars(font, lbl.text);
-      if (miss.length) art.warnings.push('Font has no glyph for: ' + miss.join(' '));
     }
-    if (d) art.lakes.push({ id: lake.id, d: d });
+    var miss = missingChars(font, lbl.text);
+    if (miss.length) art.warnings.push('Font has no glyph for: ' + miss.join(' '));
   });
 
-  art.streets = streetPaths();
+  // info box may add one more window, so build it before the lake fills
+  buildInfoboxArt(art, windowsByLake, font);
+
+  // pass 2: lake fills with all windows subtracted
+  state.lakes.forEach(function (lake) {
+    var d = lakePathD(lake, windowsByLake[lake.id]);
+    if (d) art.lakes.push({ id: lake.id, d: d });
+  });
 
   var pm = viewMatrix(true);
   state.pins.forEach(function (pin) {
@@ -842,6 +1283,27 @@ function buildArt() {
     if (m2.length) art.warnings.push('Font has no glyph for: ' + m2.join(' '));
   }
 
+  buildScalebarArt(art, font);
+  buildCompassArt(art, font);
+
+  // streets go last: they clip around text windows, labels, compass, scale bar
+  var keepout = { polys: labelKeepouts.slice(), discs: [] };
+  Object.keys(windowsByLake).forEach(function (k) {
+    windowsByLake[k].forEach(function (w) { keepout.polys.push(w); });
+  });
+  if (art.scalebar) {
+    keepout.polys.push([
+      [art.scalebar.x - art.scalebar.hitHW, art.scalebar.y - art.scalebar.hitHH],
+      [art.scalebar.x + art.scalebar.hitHW, art.scalebar.y - art.scalebar.hitHH],
+      [art.scalebar.x + art.scalebar.hitHW, art.scalebar.y + art.scalebar.hitHH],
+      [art.scalebar.x - art.scalebar.hitHW, art.scalebar.y + art.scalebar.hitHH]
+    ]);
+  }
+  if (art.compass) {
+    keepout.discs.push({ x: art.compass.x, y: art.compass.y, r: art.compass.hitR });
+  }
+  art.streets = streetPaths(keepout);
+
   if (state.cutCircle) {
     var r = c;
     art.cut = 'M' + fmt(c - r) + ' ' + fmt(c) +
@@ -867,11 +1329,13 @@ function render() {
   requestAnimationFrame(function () { renderQueued = false; doRender(); });
 }
 
+var lastArt = null;
 function doRender() {
   var svg = $('preview');
   var D = state.diameter, c = D / 2;
   svg.setAttribute('viewBox', '0 0 ' + fmt(D) + ' ' + fmt(D));
   var art = buildArt();
+  lastArt = art;
   var wood = state.woodPreview;
   var ink = wood ? '#2f1c0c' : '#000000';
   var s = '';
@@ -918,6 +1382,24 @@ function doRender() {
          '" stroke-width="0.35" stroke-dasharray="1 0.7"/>';
     s += '</g>';
   });
+  s += '</g><g id="pv-extras">';
+  if (art.scalebar) {
+    s += '<g class="extra-hit" data-extra="scalebar"><path d="' + art.scalebar.d + '" fill="' + ink + '"/>' +
+         '<rect x="' + fmt(art.scalebar.x - art.scalebar.hitHW) + '" y="' + fmt(art.scalebar.y - art.scalebar.hitHH) +
+         '" width="' + fmt(art.scalebar.hitHW * 2) + '" height="' + fmt(art.scalebar.hitHH * 2) +
+         '" fill="rgba(0,0,0,0)"/></g>';
+  }
+  if (art.compass) {
+    s += '<g class="extra-hit" data-extra="compass"><path d="' + art.compass.d + '" fill="' + ink + '"/>' +
+         '<circle cx="' + fmt(art.compass.x) + '" cy="' + fmt(art.compass.y) + '" r="' + fmt(art.compass.hitR) +
+         '" fill="rgba(0,0,0,0)"/></g>';
+  }
+  if (art.infobox) {
+    s += '<g class="extra-hit" data-extra="infobox"><path d="' + art.infobox.d + '" fill="' + ink + '"/>' +
+         '<rect x="' + fmt(art.infobox.x - art.infobox.hitHW) + '" y="' + fmt(art.infobox.y - art.infobox.hitHH) +
+         '" width="' + fmt(art.infobox.hitHW * 2) + '" height="' + fmt(art.infobox.hitHH * 2) +
+         '" fill="rgba(0,0,0,0)"/></g>';
+  }
   s += '</g>';
   if (art.cut) {
     s += '<path d="' + art.cut + '" fill="none" stroke="' + (wood ? '#00000033' : CUT_COLOR) +
@@ -931,7 +1413,7 @@ function doRender() {
     wEl.textContent = art.warnings.join(' ');
   } else wEl.hidden = true;
 
-  if (state.streetOpts.enabled && state.streets.loaded && streetsStale()) {
+  if (state.streetOpts.enabled && state.streets.loaded && !streetsLoading && streetsStale()) {
     streetStatus('Map view moved — click “Load streets for current view” to refresh.');
   }
 }
@@ -986,6 +1468,18 @@ function exportSVGString() {
       out += '<path d="' + p.d + '" fill="' + ENGRAVE_COLOR + '" stroke="none"/>\n';
     });
     out += '</g>\n';
+  }
+  if (art.scalebar) {
+    out += '<g id="ENGRAVE_scalebar">\n<path d="' + art.scalebar.d + '" fill="' + ENGRAVE_COLOR +
+           '" stroke="none"/>\n</g>\n';
+  }
+  if (art.compass) {
+    out += '<g id="ENGRAVE_compass">\n<path d="' + art.compass.d + '" fill="' + ENGRAVE_COLOR +
+           '" stroke="none"/>\n</g>\n';
+  }
+  if (art.infobox) {
+    out += '<g id="ENGRAVE_infobox">\n<path d="' + art.infobox.d + '" fill="' + ENGRAVE_COLOR +
+           '" stroke="none"/>\n</g>\n';
   }
   if (art.cut) {
     out += '<g id="CUT_outline">\n<path d="' + art.cut + '" fill="none" stroke="' + CUT_COLOR +
@@ -1053,13 +1547,15 @@ function ringsFromGeoJSON(geo) {
   return polys;
 }
 
-function addLakeFromGeoJSON(geojson, name, region, uid) {
+function addLakeFromGeoJSON(geojson, name, region, uid, extratags) {
   var polys = ringsFromGeoJSON(geojson);
   if (!polys.length) return null;
   var lake = {
     id: 'lk' + (++lakeSeq),
     uid: uid || null,
     name: name || 'Lake',
+    region: region || '',
+    extratags: extratags || null,
     polys: polys,
     label: { text: name || 'Lake', dx: 0, dy: 0, angle: 0, size: null, visible: true }
   };
@@ -1075,6 +1571,7 @@ function addLakeFromGeoJSON(geojson, name, region, uid) {
   computeFit(true);
   state.lakes.forEach(autoPlaceLabel);
   renderLakeList();
+  autofillInfobox();
   render();
   return lake;
 }
@@ -1084,8 +1581,9 @@ function removeLake(id) {
   delete geomCache[id];
   if (state.selected === id) closeLabelEditor();
   if (state.lakes.length) { computeFit(true); state.lakes.forEach(autoPlaceLabel); }
-  renderLakeList();
+  autofillInfobox();
   render();
+  renderLakeList();
 }
 
 function renderLakeList() {
@@ -1149,6 +1647,89 @@ function renderPinList() {
 }
 
 /* ------------------------------------------------------------
+ * Info box data (auto area + depth from OSM tags / Wikidata)
+ * ---------------------------------------------------------- */
+function infoStatus(msg) {
+  var el = $('infobox-status');
+  if (el) el.textContent = msg || '';
+}
+function metersToFeetLabel(mVal) {
+  return Math.round(mVal * 3.28084).toLocaleString('en-US') + ' ft';
+}
+function parseDepthTag(tags) {
+  var v = tags.maxdepth || tags.depth || tags.max_depth;
+  if (!v) return '';
+  var num = parseFloat(String(v).replace(',', '.'));
+  if (!isFinite(num) || num <= 0) return '';
+  if (/ft|'/i.test(String(v))) return Math.round(num).toLocaleString('en-US') + ' ft';
+  return metersToFeetLabel(num); // OSM depth tags default to meters
+}
+
+function autofillInfobox() {
+  if (!state.infobox.on || state.lakes.length !== 1) return;
+  var lake = state.lakes[0];
+  if (state.infobox.forLake !== lake.id) {
+    state.infobox.depth = '';
+    state.infobox.area = '';
+    $('info-depth').value = '';
+    $('info-area').value = '';
+    state.infobox.forLake = lake.id;
+  }
+  if (!state.infobox.area.trim()) {
+    var a = formatAreaMi2(lakeAreaMi2(lake));
+    if (a) { state.infobox.area = a; $('info-area').value = a; }
+  }
+  if (!state.infobox.depth.trim()) {
+    var tags = lake.extratags || {};
+    var d = parseDepthTag(tags);
+    if (d) {
+      state.infobox.depth = d;
+      $('info-depth').value = d;
+      infoStatus('Depth from OpenStreetMap · area measured from the outline. Edit either field freely.');
+    } else if (tags.wikidata) {
+      infoStatus('Looking up depth on Wikidata…');
+      fetchWikidataDepth(tags.wikidata, lake);
+    } else {
+      infoStatus('Depth not in the map data — type it in if you know it. Area is measured from the outline.');
+    }
+  }
+  render();
+}
+
+function fetchWikidataDepth(qid, lake) {
+  fetch('https://www.wikidata.org/wiki/Special:EntityData/' + encodeURIComponent(qid) + '.json')
+    .then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function (json) {
+      var ent = json.entities && json.entities[qid];
+      var claims = ent && ent.claims && ent.claims.P4511; // vertical (max) depth
+      var out = '';
+      if (claims && claims.length) {
+        var dv = claims[0].mainsnak && claims[0].mainsnak.datavalue;
+        var val = dv && dv.value && parseFloat(dv.value.amount);
+        var unit = (dv && dv.value && dv.value.unit) || '';
+        if (isFinite(val) && val > 0) {
+          out = /Q3710$/.test(unit) ? Math.round(val).toLocaleString('en-US') + ' ft'
+                                    : metersToFeetLabel(val);
+        }
+      }
+      if (out && state.lakes[0] === lake && !state.infobox.depth.trim()) {
+        state.infobox.depth = out;
+        $('info-depth').value = out;
+        infoStatus('Depth from Wikidata · area measured from the outline. Edit either field freely.');
+        render();
+      } else if (!out) {
+        infoStatus('Depth not listed on Wikidata — type it in if you know it.');
+      }
+    })
+    .catch(function () {
+      infoStatus('Wikidata lookup failed — type the depth in if you know it.');
+    });
+}
+
+/* ------------------------------------------------------------
  * Nominatim search
  * ---------------------------------------------------------- */
 function regionFromAddress(a) {
@@ -1169,9 +1750,9 @@ function doSearch() {
   var list = $('search-results');
   list.innerHTML = '';
   status.textContent = 'Searching…';
-  // polygon_threshold trims megabyte geometries server-side (~5.5 m tolerance)
-  // while staying far below engraving resolution for small lakes
-  var url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&polygon_geojson=1&polygon_threshold=0.00005&addressdetails=1&limit=6&q=' +
+  // lightweight search (no geometry) — full outline is fetched on click at a
+  // resolution matched to the lake's size
+  var url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&extratags=1&limit=6&q=' +
     encodeURIComponent(q);
   fetch(url, { headers: { 'Accept': 'application/json' } })
     .then(function (res) {
@@ -1181,10 +1762,10 @@ function doSearch() {
     })
     .then(function (rows) {
       var usable = rows.filter(function (r) {
-        return r.geojson && (r.geojson.type === 'Polygon' || r.geojson.type === 'MultiPolygon');
+        return r.osm_type === 'relation' || r.osm_type === 'way';
       });
       if (!usable.length) {
-        status.textContent = 'No lake outlines found. Try adding the region, e.g. “Keuka Lake New York”.';
+        status.textContent = 'Nothing found with an outline. Try adding the region, e.g. “Keuka Lake New York”.';
         return;
       }
       status.textContent = 'Click a result to add it:';
@@ -1196,22 +1777,63 @@ function doSearch() {
         li.appendChild(badge);
         li.appendChild(document.createTextNode(
           (r.display_name || '').length > 90 ? r.display_name.slice(0, 90) + '…' : (r.display_name || '')));
-        li.addEventListener('click', function () {
-          var uid = (r.osm_type || '') + (r.osm_id || '');
-          if (uid && state.lakes.some(function (l) { return l.uid === uid; })) {
-            status.textContent = 'That lake is already on the coaster.';
-            return;
-          }
-          addLakeFromGeoJSON(r.geojson, shortName(r), regionFromAddress(r.address), uid);
-          list.innerHTML = '';
-          status.textContent = 'Added “' + shortName(r) + '”.';
-        });
+        li.addEventListener('click', function () { addLakeFromSearchResult(r, li); });
         list.appendChild(li);
       });
     })
     .catch(function (err) {
       status.textContent = String(err.message || err) +
         ' (Search needs internet access to nominatim.openstreetmap.org.)';
+    });
+}
+
+// Fetch the outline at a tolerance proportional to the lake's extent, so a
+// Great Lake arrives as a manageable, still shoreline-accurate polygon and a
+// small pond keeps full detail.
+function adaptiveThreshold(r) {
+  var bb = r.boundingbox; // [minlat, maxlat, minlon, maxlon] as strings
+  if (!bb || bb.length !== 4) return 0.00005;
+  var dLat = Math.abs(parseFloat(bb[1]) - parseFloat(bb[0]));
+  var midLat = (parseFloat(bb[0]) + parseFloat(bb[1])) / 2;
+  var dLon = Math.abs(parseFloat(bb[3]) - parseFloat(bb[2])) * Math.cos(deg2rad(midLat));
+  var extent = Math.max(dLat, dLon, 0.001);
+  return Math.min(0.003, Math.max(0.00002, extent * 0.0004));
+}
+
+function addLakeFromSearchResult(r, li) {
+  var status = $('search-status');
+  var uid = (r.osm_type || '') + (r.osm_id || '');
+  if (uid && state.lakes.some(function (l) { return l.uid === uid; })) {
+    status.textContent = 'That lake is already on the coaster.';
+    return;
+  }
+  var prefix = { relation: 'R', way: 'W', node: 'N' }[r.osm_type];
+  if (!prefix) { status.textContent = 'That result has no outline — pick another.'; return; }
+  status.textContent = 'Fetching the outline of “' + shortName(r) + '”…';
+  if (li) li.style.opacity = '0.5';
+  var url = 'https://nominatim.openstreetmap.org/lookup?format=jsonv2&polygon_geojson=1' +
+    '&polygon_threshold=' + adaptiveThreshold(r) +
+    '&addressdetails=1&extratags=1&osm_ids=' + prefix + r.osm_id;
+  fetch(url, { headers: { 'Accept': 'application/json' } })
+    .then(function (res) {
+      if (!res.ok) throw new Error('Outline fetch failed (HTTP ' + res.status + ').');
+      return res.json();
+    })
+    .then(function (rows) {
+      var g = rows && rows[0] && rows[0].geojson;
+      if (!g || (g.type !== 'Polygon' && g.type !== 'MultiPolygon' && g.type !== 'GeometryCollection')) {
+        throw new Error('No lake outline available for that result — try another.');
+      }
+      var added = addLakeFromGeoJSON(g, shortName(r),
+        regionFromAddress((rows[0].address || r.address)), uid,
+        rows[0].extratags || r.extratags || null);
+      if (!added) throw new Error('That outline could not be used — try another result.');
+      $('search-results').innerHTML = '';
+      status.textContent = 'Added “' + shortName(r) + '”.';
+    })
+    .catch(function (err) {
+      if (li) li.style.opacity = '';
+      status.textContent = String(err.message || err);
     });
 }
 
@@ -1228,9 +1850,16 @@ function setupPointer() {
   }
 
   svg.addEventListener('pointerdown', function (ev) {
-    var tp = ev.target.closest ? ev.target.closest('[data-pin]') : null;
-    var t = !tp && ev.target.closest ? ev.target.closest('[data-lbl]') : null;
-    if (tp) {
+    var tx = ev.target.closest ? ev.target.closest('[data-extra]') : null;
+    var tp = !tx && ev.target.closest ? ev.target.closest('[data-pin]') : null;
+    var t = !tx && !tp && ev.target.closest ? ev.target.closest('[data-lbl]') : null;
+    if (tx) {
+      var kind = tx.getAttribute('data-extra');
+      var piece = lastArt && lastArt[kind];
+      if (!piece) return;
+      drag = { kind: 'extra', which: kind, x: ev.clientX, y: ev.clientY,
+               x0: piece.x, y0: piece.y, moved: false };
+    } else if (tp) {
       var pid = tp.getAttribute('data-pin');
       var pin = state.pins.find(function (p) { return p.id === pid; });
       if (!pin) return;
@@ -1259,6 +1888,10 @@ function setupPointer() {
     if (drag.kind === 'pan') {
       state.view.tx = drag.tx0 + dx;
       state.view.ty = drag.ty0 + dy;
+      render();
+    } else if (drag.kind === 'extra') {
+      state[drag.which].x = drag.x0 + dx;
+      state[drag.which].y = drag.y0 + dy;
       render();
     } else if (drag.kind === 'pin') {
       var pin = state.pins.find(function (p) { return p.id === drag.id; });
@@ -1361,7 +1994,7 @@ function bindUI() {
     function () { computeFit(false); });
   slider('arc-spacing', 'arc-spacing-val', 'arcSpacing', function (v) { return v.toFixed(2) + ' em'; });
   slider('label-size', 'label-size-val', 'labelSize', function (v) { return v.toFixed(1) + ' mm'; });
-  slider('detail', 'detail-val', 'detailTol', function (v) { return v.toFixed(2) + ' mm'; },
+  slider('smoothing', 'smoothing-val', 'smoothing', function (v) { return Math.round(v * 100) + '%'; },
     function () { geomCache = {}; });
   slider('min-island', 'island-val', 'minIsland', function (v) { return v.toFixed(1) + ' mm²'; },
     function () { geomCache = {}; });
@@ -1475,6 +2108,50 @@ function bindUI() {
     render();
   });
   $('pin-size-val').textContent = '4.8 mm';
+
+  // extras: scale bar, compass, info box
+  $('scalebar-on').addEventListener('change', function () {
+    state.scalebar.on = this.checked;
+    render();
+  });
+  $('compass-on').addEventListener('change', function () {
+    state.compass.on = this.checked;
+    $('compass-size-row').hidden = !this.checked;
+    render();
+  });
+  $('compass-size').addEventListener('input', function () {
+    state.compass.size = parseFloat(this.value);
+    $('compass-size-val').textContent = state.compass.size.toFixed(0) + ' mm';
+    render();
+  });
+  $('compass-size-val').textContent = '16 mm';
+  $('infobox-on').addEventListener('change', function () {
+    if (this.checked && state.lakes.length !== 1) {
+      this.checked = false;
+      infoStatus(state.lakes.length ? 'The info box works with exactly one lake on the coaster.'
+                                    : 'Add a lake first.');
+      $('infobox-body').hidden = false;
+      return;
+    }
+    state.infobox.on = this.checked;
+    $('infobox-body').hidden = !this.checked;
+    if (this.checked) autofillInfobox();
+    render();
+  });
+  $('infobox-scale').addEventListener('input', function () {
+    state.infobox.scale = parseFloat(this.value);
+    $('infobox-scale-val').textContent = '×' + state.infobox.scale.toFixed(2);
+    render();
+  });
+  $('infobox-scale-val').textContent = '×1.00';
+  $('info-depth').addEventListener('input', function () {
+    state.infobox.depth = this.value;
+    render();
+  });
+  $('info-area').addEventListener('input', function () {
+    state.infobox.area = this.value;
+    render();
+  });
   $('lbl-auto').addEventListener('click', function () {
     var lk = selectedLake();
     if (lk) {
@@ -1570,6 +2247,15 @@ window.__lakeApp = {
   autoPlaceAll: function () { state.lakes.forEach(autoPlaceLabel); render(); },
   addPin: addPin,
   removePin: removePin,
+  movePinMM: function (id, x, y) {
+    var pin = state.pins.find(function (p) { return p.id === id; });
+    if (pin) {
+      var pr = invViewPoint(x, y);
+      pin.px = pr[0];
+      pin.py = pr[1];
+      render();
+    }
+  },
   // ways: [{highway:'residential', coords:[[lon,lat],...]}] — same pipeline as Overpass
   setStreetsFromWays: function (ways) {
     var elements = (ways || []).map(function (w) {

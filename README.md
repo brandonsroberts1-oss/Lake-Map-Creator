@@ -11,7 +11,13 @@ state curved along the top and the title curved along the bottom.
 
 - **Real lake outlines** — search any lake worldwide via OpenStreetMap
   (Nominatim). Add as many lakes as you want on one coaster; islands inside
-  lakes are preserved as un-engraved holes.
+  lakes are preserved as un-engraved holes. Outlines are fetched at a
+  resolution matched to the lake's size (a Great Lake arrives shoreline-
+  accurate but manageable; a pond keeps full detail).
+- **Shoreline smoothing** — a proper low-pass filter (uniform resample +
+  Gaussian, then simplification), not just point-dropping. Slider up =
+  smoother: intricate island fields and fjord-y shorelines melt into the
+  clean silhouettes that look right engraved on wood.
 - **Curved (arc) text** on top and bottom, with adjustable size and
   letter-spacing, just like the sample coaster.
 - **Small labels next to each lake**, auto-placed along each lake's long axis
@@ -28,6 +34,20 @@ state curved along the top and the title curved along the bottom.
 - **Location pins**: drop one or more classic map pins (tip = the spot) to
   mark where someone lives, the family cabin, a proposal spot… drag to
   position; the pin engraves solid with a knocked-out center dot.
+- **Scale bar in miles** — true to the map scale (Mercator, cos-latitude
+  corrected), picks a round value (e.g. “5 mi”, or feet for tiny ponds), and
+  stays accurate as you zoom the map. Draggable.
+- **Nautical compass rose** — classic 8-point rose with ring and “N”,
+  toggleable with a size slider, draggable, and it rotates with the map so
+  north stays true.
+- **Lake info box** (single-lake designs) — a nautical plaque with anchor,
+  double border, and: lake name, state/region, center coordinates, max depth
+  and area in square miles. Area is measured from the actual outline; depth
+  auto-fills from OpenStreetMap tags or Wikidata when available, and both
+  fields are freely editable. Where the plaque overlaps the lake, a clean
+  window is carved out of the fill (true polygon boolean, not a clip-path).
+- Streets automatically clip around all text windows, labels, the compass,
+  and the scale bar, so nothing engraves on top of anything else.
 - **Four fonts** (bundled, no internet needed for rendering):
   - *Libre Baskerville* — closest to the sample coaster's engraved serif
   - *EB Garamond* (weight 500) — classic old-style serif
@@ -97,9 +117,9 @@ detail starts to blur into the burn.
 ```
 index.html          app UI
 css/style.css
-js/app.js           projection, geometry, arc-text layout, export
+js/app.js           projection, geometry, smoothing, arc-text layout, export
 js/fonts-data.js    bundled fonts (base64 TTF, generated — see fonts/README.md)
-js/vendor/          opentype.js 1.3.4 (MIT)
+js/vendor/          opentype.js 1.3.4 (MIT), polygon-clipping 0.15 (MIT)
 fonts/              font licenses (SIL OFL 1.1) + regeneration notes
 tools/e2e-test.mjs  Playwright smoke test of the whole pipeline
 ```
@@ -117,5 +137,7 @@ npm test             # runs tools/e2e-test.mjs against a local server
   [ODbL](https://www.openstreetmap.org/copyright). If you sell engraved items
   made from these maps, credit “Map data © OpenStreetMap contributors” on the
   listing or packaging.
+- Depth data (when auto-filled) may come from
+  [Wikidata](https://www.wikidata.org) (CC0).
 - Fonts under the SIL Open Font License 1.1 (see `fonts/`).
-- `opentype.js` under MIT (see `js/vendor/opentype.LICENSE.txt`).
+- `opentype.js` and `polygon-clipping` under MIT (see `js/vendor/`).

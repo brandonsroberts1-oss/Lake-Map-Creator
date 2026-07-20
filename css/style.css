@@ -131,6 +131,10 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .check { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--text); cursor: pointer; }
 .check input { accent-color: var(--accent); }
 .check-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; margin: 8px 0; }
+.extra-block { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+
+#preview .extra-hit { cursor: grab; }
+#preview .extra-hit:active { cursor: grabbing; }
 
 #preview .pin-hit { cursor: grab; }
 #preview .pin-hit:active { cursor: grabbing; }

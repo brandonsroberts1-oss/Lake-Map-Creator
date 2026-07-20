@@ -123,8 +123,38 @@
       <p class="hint">Drag a pin onto the home, cabin or memorable spot &mdash; the tip marks the location. Load streets first to find the exact place.</p>
     </section>
 
+    <section class="panel" id="panel-extras">
+      <h2>7 &middot; Map extras</h2>
+
+      <label class="check"><input type="checkbox" id="scalebar-on"> scale bar (miles) &mdash; true to the map scale</label>
+
+      <div class="extra-block">
+        <label class="check"><input type="checkbox" id="compass-on"> nautical compass rose</label>
+        <label class="field slider-field" id="compass-size-row" hidden>
+          <span>Compass size <b id="compass-size-val"></b></span>
+          <input type="range" id="compass-size" min="8" max="36" step="0.5" value="16">
+        </label>
+      </div>
+
+      <div class="extra-block">
+        <label class="check"><input type="checkbox" id="infobox-on"> lake info box (single lake only)</label>
+        <div id="infobox-body" hidden>
+          <label class="field slider-field">
+            <span>Info box size <b id="infobox-scale-val"></b></span>
+            <input type="range" id="infobox-scale" min="0.7" max="1.6" step="0.05" value="1">
+          </label>
+          <label class="field"><span>Max depth (auto-filled when known &mdash; edit freely)</span>
+            <input type="text" id="info-depth" placeholder="e.g. 618 ft"></label>
+          <label class="field"><span>Area (auto-computed &mdash; edit freely)</span>
+            <input type="text" id="info-area" placeholder="e.g. 66.9 sq mi"></label>
+          <div id="infobox-status" class="hint"></div>
+        </div>
+      </div>
+      <p class="hint">Scale bar, compass and info box are all draggable on the preview.</p>
+    </section>
+
     <section class="panel" id="panel-engrave">
-      <h2>7 &middot; Engraving</h2>
+      <h2>8 &middot; Engraving</h2>
       <label class="field num-field">
         <span>Coaster diameter</span>
         <span class="num-wrap"><input type="number" id="diameter" min="40" max="300" step="0.01" value="96.52"> mm</span>
@@ -132,8 +162,8 @@
       </label>
       <label class="check"><input type="checkbox" id="cut-circle" checked> include cut outline circle (red)</label>
       <label class="field slider-field">
-        <span>Detail (simplify tolerance) <b id="detail-val"></b></span>
-        <input type="range" id="detail" min="0.02" max="0.30" step="0.01" value="0.08">
+        <span>Shoreline smoothing <b id="smoothing-val"></b></span>
+        <input type="range" id="smoothing" min="0" max="1" step="0.05" value="0.6">
       </label>
       <label class="field slider-field">
         <span>Minimum island size <b id="island-val"></b></span>
@@ -164,6 +194,7 @@
 </footer>
 
 <script src="js/vendor/opentype.min.js"></script>
+<script src="js/vendor/polygon-clipping.umd.min.js"></script>
 <script src="js/fonts-data.js"></script>
 <script src="js/app.js"></script>
 </body>
