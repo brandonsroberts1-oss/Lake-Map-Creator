@@ -14,6 +14,24 @@ var ARC_GAP = 2.2;       // mm between arc text band and map safe area
 var SIDE_MARGIN = 8.0;   // mm horizontal map margin
 var CUT_COLOR = '#FF0000';
 var ENGRAVE_COLOR = '#000000';
+var STREET_COLOR = '#0000FF'; // separate layer: set to Score in XCS
+
+var OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter'
+];
+var STREET_CATS = [
+  { key: 'major', label: 'highways',        re: /^(motorway|trunk|primary)(_link)?$/ },
+  { key: 'main',  label: 'main roads',      re: /^(secondary|tertiary)(_link)?$/ },
+  { key: 'local', label: 'local streets',   re: /^(residential|unclassified|living_street|pedestrian|road)$/ },
+  { key: 'minor', label: 'service & paths', re: /^(service|track|cycleway|footway|path|bridleway|steps)$/ }
+];
+function streetCatOf(hw) {
+  for (var i = 0; i < STREET_CATS.length; i++) {
+    if (STREET_CATS[i].re.test(hw)) return STREET_CATS[i].key;
+  }
+  return null;
+}
 
 var FONT_DEFS = [
   { key: 'baskerville', name: 'Libre Baskerville', desc: 'closest to the sample coaster', data: 'LibreBaskerville' },
@@ -42,9 +60,15 @@ var state = {
   detailTol: 0.08,          // mm simplify tolerance
   minIsland: 0.5,           // mm^2 smallest kept island / ring
   woodPreview: true,
-  selected: null            // lake id whose label is being edited
+  selected: null,           // lake id whose label is being edited
+  streets: { loaded: false, ways: [], bbox: null }, // ways: {cat, pts[projected]}
+  streetOpts: { enabled: false, major: true, main: true, local: true, minor: false, width: 0.2 },
+  pins: [],                 // {id, px, py} in projected coords (track the map)
+  pinSize: 4.8,             // mm pin height
+  selectedPin: null
 };
 var lakeSeq = 0;
+var pinSeq = 0;
 
 /* ------------------------------------------------------------
  * Small helpers
@@ -77,6 +101,38 @@ function project(lon, lat) {
     EARTH_R * deg2rad(lon),
     -EARTH_R * Math.log(Math.tan(Math.PI / 4 + deg2rad(la) / 2))
   ];
+}
+function unproject(p) {
+  return [
+    p[0] / EARTH_R * 180 / Math.PI,
+    (2 * Math.atan(Math.exp(-p[1] / EARTH_R)) - Math.PI / 2) * 180 / Math.PI
+  ];
+}
+
+// coaster mm -> projected coords (inverse of viewMatrix(true))
+function invViewPoint(x, y) {
+  var v = state.view;
+  var s = Math.max(v.baseScale * v.scaleMul, 1e-12);
+  var r = deg2rad(v.rotDeg);
+  var m = viewMatrix(true);
+  var dx = x - m[4], dy = y - m[5];
+  var cos = Math.cos(r), sin = Math.sin(r);
+  return [(cos * dx + sin * dy) / s, (-sin * dx + cos * dy) / s];
+}
+
+// lon/lat bounding box of the visible coaster disc (pad = growth factor)
+function visibleLonLatBBox(pad) {
+  var D = state.diameter, c = D / 2;
+  var w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
+  for (var i = 0; i < 12; i++) {
+    var a = i / 12 * 2 * Math.PI;
+    var ll = unproject(invViewPoint(c + c * Math.cos(a) * (pad || 1), c + c * Math.sin(a) * (pad || 1)));
+    if (ll[0] < w) w = ll[0];
+    if (ll[0] > e) e = ll[0];
+    if (ll[1] < s) s = ll[1];
+    if (ll[1] > n) n = ll[1];
+  }
+  return { s: s, w: w, n: n, e: e };
 }
 
 function signedArea(pts) {
@@ -361,6 +417,13 @@ function autoPlaceLabel(lake) {
   var ang = Math.atan2(st.ey, st.ex) * 180 / Math.PI;
   if (ang <= -90) ang += 180;
   if (ang > 90) ang -= 180;
+  if (lbl.boxed) {
+    // boxed labels sit at the lake's center, along its axis when elongated
+    lbl.angle = st.elong < 1.8 ? 0 : Math.round(ang);
+    lbl.dx = 0;
+    lbl.dy = 0;
+    return;
+  }
   lbl.angle = st.elong < 1.25 ? 0 : Math.round(ang);
   var size = lbl.size || state.labelSize;
   var off = st.halfWid + size * 0.75 + 1.0;
@@ -373,6 +436,150 @@ function autoPlaceLabel(lake) {
   var pick = d1 <= d2 ? c1 : c2;
   lbl.dx = pick[0] - st.cx;
   lbl.dy = pick[1] - st.cy;
+}
+
+/* ------------------------------------------------------------
+ * Streets (OpenStreetMap Overpass)
+ * ---------------------------------------------------------- */
+function streetStatus(msg) {
+  var el = $('streets-status');
+  if (el) el.textContent = msg || '';
+}
+
+// Overpass "way" elements (with .tags.highway and .geometry) -> state.streets
+function applyStreetElements(elements, bb) {
+  var ways = [], totalPts = 0;
+  elements.forEach(function (el) {
+    if (el.type !== 'way' || !el.geometry || !el.tags || !el.tags.highway) return;
+    var cat = streetCatOf(el.tags.highway);
+    if (!cat) return;
+    var pts = el.geometry.map(function (g) { return project(g.lon, g.lat); });
+    if (pts.length < 2) return;
+    totalPts += pts.length;
+    ways.push({ cat: cat, pts: pts });
+  });
+  // keep interaction snappy on dense urban areas
+  var sc = state.view.baseScale * state.view.scaleMul || 1;
+  if (totalPts > 45000) {
+    ways.forEach(function (w) { w.pts = dpChain(w.pts, 0.05 / sc); });
+  }
+  state.streets = { loaded: true, ways: ways, bbox: bb };
+  var counts = {};
+  ways.forEach(function (w) { counts[w.cat] = (counts[w.cat] || 0) + 1; });
+  streetStatus(ways.length ? ways.length + ' street segments loaded.' :
+    'No streets found in this area.');
+  render();
+}
+
+function fetchStreets() {
+  if (!state.lakes.length) { streetStatus('Add a lake first, then load streets.'); return; }
+  var bb = visibleLonLatBBox(1.06);
+  var midLat = (bb.n + bb.s) / 2;
+  var span = Math.max(bb.n - bb.s, (bb.e - bb.w) * Math.cos(deg2rad(midLat)));
+  if (span > 0.6) {
+    streetStatus('This view covers too much area for street data (' + span.toFixed(2) +
+      '°). Streets are meant for a single small lake — zoom in first.');
+    return;
+  }
+  streetStatus('Loading streets from OpenStreetMap…');
+  var re = 'motorway|trunk|primary|secondary|tertiary|residential|unclassified|living_street|pedestrian|road|service|track|cycleway|footway|path|bridleway|steps';
+  var q = '[out:json][timeout:30];way["highway"~"^(' + re + ')(_link)?$"](' +
+    [bb.s, bb.w, bb.n, bb.e].join(',') + ');out geom qt;';
+  (function tryEndpoint(i) {
+    fetch(OVERPASS_ENDPOINTS[i], {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'data=' + encodeURIComponent(q)
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (json) {
+      applyStreetElements(json.elements || [], bb);
+    }).catch(function (err) {
+      if (i + 1 < OVERPASS_ENDPOINTS.length) tryEndpoint(i + 1);
+      else streetStatus('Street data failed to load (' + (err.message || err) +
+        '). Overpass may be busy — try again in a minute.');
+    });
+  })(0);
+}
+
+// Split a polyline into runs inside the allowed disc (rim margin + arc bands),
+// with bisection-refined boundary points. Long segments are subdivided first.
+function clipRuns(pts, D, bands) {
+  var sub = [];
+  for (var i = 0; i < pts.length; i++) {
+    if (i) {
+      var a = pts[i - 1], b = pts[i];
+      var n = Math.min(48, Math.floor(Math.hypot(b[0] - a[0], b[1] - a[1]) / 1.2));
+      for (var k = 1; k <= n; k++) {
+        sub.push([a[0] + (b[0] - a[0]) * k / (n + 1), a[1] + (b[1] - a[1]) * k / (n + 1)]);
+      }
+    }
+    sub.push(pts[i]);
+  }
+  function boundary(out, ins) {
+    var a = out, b = ins;
+    for (var j = 0; j < 8; j++) {
+      var mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      if (pointAllowed(mid[0], mid[1], D, bands)) b = mid; else a = mid;
+    }
+    return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  }
+  var runs = [], cur = null, prev = null, prevOk = false;
+  for (var m = 0; m < sub.length; m++) {
+    var p = sub[m];
+    var ok = pointAllowed(p[0], p[1], D, bands);
+    if (ok) {
+      if (!cur) {
+        cur = [];
+        if (prev && !prevOk) cur.push(boundary(prev, p));
+      }
+      cur.push(p);
+    } else if (cur) {
+      if (prev && prevOk) cur.push(boundary(p, prev));
+      runs.push(cur);
+      cur = null;
+    }
+    prev = p; prevOk = ok;
+  }
+  if (cur) runs.push(cur);
+  return runs;
+}
+
+// -> [{cat, d}] for currently enabled street categories, clipped & simplified
+function streetPaths() {
+  var o = state.streetOpts;
+  if (!o.enabled || !state.streets.loaded || !state.streets.ways.length) return [];
+  var m = viewMatrix(true);
+  var D = state.diameter;
+  var bands = [arcBand('top'), arcBand('bottom')].filter(Boolean);
+  var byCat = {};
+  state.streets.ways.forEach(function (w) {
+    if (!o[w.cat]) return;
+    var mm = w.pts.map(function (p) { return applyM(m, p); });
+    clipRuns(mm, D, bands).forEach(function (run) {
+      run = dpChain(run, state.detailTol * 0.6);
+      if (run.length < 2) return;
+      var len = 0;
+      for (var i = 1; i < run.length; i++) len += Math.hypot(run[i][0] - run[i - 1][0], run[i][1] - run[i - 1][1]);
+      if (len < 1.2) return;
+      var d = '';
+      run.forEach(function (p, i) { d += (i ? 'L' : 'M') + fmt(p[0]) + ' ' + fmt(p[1]); });
+      byCat[w.cat] = (byCat[w.cat] || '') + d;
+    });
+  });
+  return STREET_CATS.filter(function (c) { return byCat[c.key]; })
+    .map(function (c) { return { cat: c.key, d: byCat[c.key] }; });
+}
+
+// has the view moved away from the area streets were loaded for?
+function streetsStale() {
+  if (!state.streets.loaded || !state.streets.bbox) return false;
+  var cur = visibleLonLatBBox(1);
+  var b = state.streets.bbox;
+  var margin = 0.02 * Math.max(b.n - b.s, b.e - b.w);
+  return cur.s < b.s - margin || cur.w < b.w - margin ||
+         cur.n > b.n + margin || cur.e > b.e + margin;
 }
 
 /* ------------------------------------------------------------
@@ -408,6 +615,75 @@ function commandsToD(cmds, m) {
     }
   });
   return d;
+}
+
+/* Shape command builders (M/L/C only, affine-transformable).
+ * dir=+1 traverses visually clockwise (positive shoelace area in our y-down
+ * screen convention, matching enforced outer-ring winding); dir=-1 reversed. */
+var KAPPA = 0.55228475;
+function roundedRectCmds(w, h, r, dir) {
+  var hw = w / 2, hh = h / 2;
+  r = Math.max(0, Math.min(r, hw, hh));
+  var k = r * KAPPA;
+  var c = [];
+  if (dir >= 0) {
+    c.push({ type: 'M', x: -hw + r, y: -hh });
+    c.push({ type: 'L', x: hw - r, y: -hh });
+    c.push({ type: 'C', x1: hw - r + k, y1: -hh, x2: hw, y2: -hh + r - k, x: hw, y: -hh + r });
+    c.push({ type: 'L', x: hw, y: hh - r });
+    c.push({ type: 'C', x1: hw, y1: hh - r + k, x2: hw - r + k, y2: hh, x: hw - r, y: hh });
+    c.push({ type: 'L', x: -hw + r, y: hh });
+    c.push({ type: 'C', x1: -hw + r - k, y1: hh, x2: -hw, y2: hh - r + k, x: -hw, y: hh - r });
+    c.push({ type: 'L', x: -hw, y: -hh + r });
+    c.push({ type: 'C', x1: -hw, y1: -hh + r - k, x2: -hw + r - k, y2: -hh, x: -hw + r, y: -hh });
+  } else {
+    c.push({ type: 'M', x: hw - r, y: -hh });
+    c.push({ type: 'L', x: -hw + r, y: -hh });
+    c.push({ type: 'C', x1: -hw + r - k, y1: -hh, x2: -hw, y2: -hh + r - k, x: -hw, y: -hh + r });
+    c.push({ type: 'L', x: -hw, y: hh - r });
+    c.push({ type: 'C', x1: -hw, y1: hh - r + k, x2: -hw + r - k, y2: hh, x: -hw + r, y: hh });
+    c.push({ type: 'L', x: hw - r, y: hh });
+    c.push({ type: 'C', x1: hw - r + k, y1: hh, x2: hw, y2: hh - r + k, x: hw, y: hh - r });
+    c.push({ type: 'L', x: hw, y: -hh + r });
+    c.push({ type: 'C', x1: hw, y1: -hh + r - k, x2: hw - r + k, y2: -hh, x: hw - r, y: -hh });
+  }
+  c.push({ type: 'Z' });
+  return c;
+}
+
+function circleCmds(cx, cy, r, dir) {
+  var k = r * KAPPA, d = dir >= 0 ? 1 : -1;
+  return [
+    { type: 'M', x: cx + r, y: cy },
+    { type: 'C', x1: cx + r, y1: cy + d * k, x2: cx + k, y2: cy + d * r, x: cx, y: cy + d * r },
+    { type: 'C', x1: cx - k, y1: cy + d * r, x2: cx - r, y2: cy + d * k, x: cx - r, y: cy },
+    { type: 'C', x1: cx - r, y1: cy - d * k, x2: cx - k, y2: cy - d * r, x: cx, y: cy - d * r },
+    { type: 'C', x1: cx + k, y1: cy - d * r, x2: cx + r, y2: cy - d * k, x: cx + r, y: cy },
+    { type: 'Z' }
+  ];
+}
+
+// Map pin, tip at origin pointing to the location, body above (height h mm).
+// Outer body + knocked-out center dot (opposite winding => works in any fill rule).
+function pinCmds(h) {
+  var s = h / 20;
+  function t(x, y) { return { x: (x - 12) * s, y: (y - 22) * s }; }
+  var base = [
+    { type: 'M', p: [12, 2] },
+    { type: 'C', p: [8.13, 2, 5, 5.13, 5, 8.5] },
+    { type: 'C', p: [5, 13.75, 12, 22, 12, 22] },
+    { type: 'C', p: [12, 22, 19, 13.75, 19, 8.5] },
+    { type: 'C', p: [19, 5.13, 15.87, 2, 12, 2] },
+    { type: 'Z', p: [] }
+  ].map(function (c) {
+    if (c.type === 'Z') return { type: 'Z' };
+    if (c.type === 'M') { var m = t(c.p[0], c.p[1]); return { type: 'M', x: m.x, y: m.y }; }
+    var p1 = t(c.p[0], c.p[1]), p2 = t(c.p[2], c.p[3]), p = t(c.p[4], c.p[5]);
+    return { type: 'C', x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, x: p.x, y: p.y };
+  });
+  // body traverses counter-clockwise (negative); dot clockwise (positive)
+  var dot = t(12, 8.5);
+  return base.concat(circleCmds(dot.x, dot.y, 2.6 * s, 1));
 }
 
 // Straight label centered at (cx,cy), rotated by angleDeg.
@@ -488,30 +764,69 @@ function missingChars(font, text) {
 function buildArt() {
   var D = state.diameter, c = D / 2;
   var font = currentFont();
-  var art = { lakes: [], labels: [], arcs: [], cut: null, warnings: [] };
+  var art = { lakes: [], labels: [], arcs: [], streets: [], pins: [], cut: null, warnings: [] };
   if (!font) return art;
 
   state.lakes.forEach(function (lake) {
     var d = lakePathD(lake);
-    if (d) art.lakes.push({ id: lake.id, d: d });
     var lbl = lake.label;
     if (lbl.visible && lbl.text.trim()) {
       var st = lakeStatsMM(lake);
       if (st) {
         var size = lbl.size || state.labelSize;
-        var ld = straightTextD(font, lbl.text, size, st.cx + lbl.dx, st.cy + lbl.dy, lbl.angle);
+        var cx = st.cx + lbl.dx, cy = st.cy + lbl.dy;
+        var ld = straightTextD(font, lbl.text, size, cx, cy, lbl.angle);
         if (ld) {
-          art.labels.push({
-            id: lake.id, d: ld,
-            cx: st.cx + lbl.dx, cy: st.cy + lbl.dy,
-            angle: lbl.angle, size: size,
+          var entry = {
+            id: lake.id, d: ld, cx: cx, cy: cy,
+            angle: lbl.angle, size: size, boxed: !!lbl.boxed,
             w: font.getAdvanceWidth(lbl.text, size, { kerning: true })
-          });
+          };
+          if (lbl.boxed) {
+            // rounded text box reversed out of the lake fill:
+            // window (hole in lake) > engraved border band > text
+            var cap = capHeightMM(font, size);
+            var r = deg2rad(lbl.angle);
+            var mtx = [Math.cos(r), Math.sin(r), -Math.sin(r), Math.cos(r), cx, cy];
+            var bandW = Math.max(0.28, size * 0.09);
+            var gap = Math.max(0.45, size * 0.14);
+            var inHW = entry.w / 2 + 0.55 * size + 0.4;
+            var inHH = cap / 2 + 0.42 * size + 0.3;
+            var rIn = Math.min(1.4, inHH * 0.5);
+            entry.d = ld +
+              commandsToD(roundedRectCmds((inHW + bandW) * 2, (inHH + bandW) * 2, rIn + bandW, 1), mtx) +
+              commandsToD(roundedRectCmds(inHW * 2, inHH * 2, rIn, -1), mtx);
+            entry.hitHW = inHW + bandW + gap;
+            entry.hitHH = inHH + bandW + gap;
+            // knockout window in the lake fill (opposite winding to outer rings)
+            d += commandsToD(roundedRectCmds((inHW + bandW + gap) * 2, (inHH + bandW + gap) * 2,
+              rIn + bandW + gap, -1), mtx);
+          } else {
+            entry.hitHW = entry.w / 2 + 1.2;
+            entry.hitHH = size * 0.85 + 0.8;
+          }
+          art.labels.push(entry);
         }
       }
       var miss = missingChars(font, lbl.text);
       if (miss.length) art.warnings.push('Font has no glyph for: ' + miss.join(' '));
     }
+    if (d) art.lakes.push({ id: lake.id, d: d });
+  });
+
+  art.streets = streetPaths();
+
+  var pm = viewMatrix(true);
+  state.pins.forEach(function (pin) {
+    var p = applyM(pm, [pin.px, pin.py]);
+    var s = state.pinSize / 20;
+    art.pins.push({
+      id: pin.id,
+      d: commandsToD(pinCmds(state.pinSize), [1, 0, 0, 1, p[0], p[1]]),
+      x: p[0], y: p[1],
+      headY: p[1] - 13.5 * s,
+      headR: 7 * s + 0.6
+    });
   });
 
   if (state.topText.trim()) {
@@ -573,7 +888,10 @@ function doRender() {
     }
   }
 
-  s += '<g id="pv-lakes">';
+  s += '<g id="pv-streets" fill="none" stroke="' + ink + '" stroke-width="' +
+       fmt(state.streetOpts.width) + '" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="0.85">';
+  art.streets.forEach(function (st) { s += '<path d="' + st.d + '"/>'; });
+  s += '</g><g id="pv-lakes">';
   art.lakes.forEach(function (l) {
     s += '<path d="' + l.d + '" fill="' + ink + '" fill-rule="evenodd"/>';
   });
@@ -584,11 +902,20 @@ function doRender() {
     var sel = state.selected === l.id;
     s += '<g class="lbl-hit" data-lbl="' + l.id + '">';
     s += '<path d="' + l.d + '" fill="' + ink + '"/>';
-    var hw = l.w / 2 + 1.2, hh = l.size * 0.85 + 0.8;
-    s += '<rect x="' + fmt(-hw) + '" y="' + fmt(-hh) + '" width="' + fmt(hw * 2) +
-         '" height="' + fmt(hh * 2) + '" transform="translate(' + fmt(l.cx) + ' ' + fmt(l.cy) +
+    s += '<rect x="' + fmt(-l.hitHW) + '" y="' + fmt(-l.hitHH) + '" width="' + fmt(l.hitHW * 2) +
+         '" height="' + fmt(l.hitHH * 2) + '" transform="translate(' + fmt(l.cx) + ' ' + fmt(l.cy) +
          ') rotate(' + fmt(l.angle) + ')" fill="rgba(0,0,0,0)" stroke="' +
          (sel ? '#3aa0ff' : 'none') + '" stroke-width="0.35" stroke-dasharray="1.2 0.8"/>';
+    s += '</g>';
+  });
+  s += '</g><g id="pv-pins">';
+  art.pins.forEach(function (p) {
+    var sel = state.selectedPin === p.id;
+    s += '<g class="pin-hit" data-pin="' + p.id + '">';
+    s += '<path d="' + p.d + '" fill="' + ink + '"/>';
+    s += '<circle cx="' + fmt(p.x) + '" cy="' + fmt(p.headY) + '" r="' + fmt(p.headR + 0.8) +
+         '" fill="rgba(0,0,0,0)" stroke="' + (sel ? '#3aa0ff' : 'none') +
+         '" stroke-width="0.35" stroke-dasharray="1 0.7"/>';
     s += '</g>';
   });
   s += '</g>';
@@ -603,6 +930,10 @@ function doRender() {
     wEl.hidden = false;
     wEl.textContent = art.warnings.join(' ');
   } else wEl.hidden = true;
+
+  if (state.streetOpts.enabled && state.streets.loaded && streetsStale()) {
+    streetStatus('Map view moved — click “Load streets for current view” to refresh.');
+  }
 }
 
 /* ------------------------------------------------------------
@@ -615,9 +946,19 @@ function exportSVGString() {
   out += '<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="' + fmt(D) +
          'mm" height="' + fmt(D) + 'mm" viewBox="0 0 ' + fmt(D) + ' ' + fmt(D) + '">\n';
   out += '<title>' + esc(state.bottomText || state.topText || 'Lake map coaster') + '</title>\n';
-  out += '<desc>Lake map coaster — 1 unit = 1 mm. Black fills = engrave, red stroke = cut. ' +
-         'Made with Lake Map Coaster Creator. Lake data © OpenStreetMap contributors (ODbL).</desc>\n';
+  out += '<desc>Lake map coaster — 1 unit = 1 mm. Black fills = engrave, blue lines = streets ' +
+         '(set to score), red stroke = cut. Made with Lake Map Coaster Creator. ' +
+         'Lake and street data © OpenStreetMap contributors (ODbL).</desc>\n';
 
+  if (art.streets.length) {
+    out += '<g id="SCORE_streets">\n';
+    art.streets.forEach(function (st) {
+      out += '<path id="streets_' + st.cat + '" d="' + st.d + '" fill="none" stroke="' + STREET_COLOR +
+             '" stroke-width="' + fmt(state.streetOpts.width) +
+             '" stroke-linecap="round" stroke-linejoin="round"/>\n';
+    });
+    out += '</g>\n';
+  }
   if (art.lakes.length) {
     out += '<g id="ENGRAVE_lakes">\n';
     art.lakes.forEach(function (l) {
@@ -628,14 +969,21 @@ function exportSVGString() {
   if (art.labels.length) {
     out += '<g id="ENGRAVE_labels">\n';
     art.labels.forEach(function (l) {
-      out += '<path d="' + l.d + '" fill="' + ENGRAVE_COLOR + '" fill-rule="evenodd" stroke="none"/>\n';
+      out += '<path d="' + l.d + '" fill="' + ENGRAVE_COLOR + '" stroke="none"/>\n';
     });
     out += '</g>\n';
   }
   if (art.arcs.length) {
     out += '<g id="ENGRAVE_arc_text">\n';
     art.arcs.forEach(function (a) {
-      out += '<path d="' + a.d + '" fill="' + ENGRAVE_COLOR + '" fill-rule="evenodd" stroke="none"/>\n';
+      out += '<path d="' + a.d + '" fill="' + ENGRAVE_COLOR + '" stroke="none"/>\n';
+    });
+    out += '</g>\n';
+  }
+  if (art.pins.length) {
+    out += '<g id="ENGRAVE_pins">\n';
+    art.pins.forEach(function (p) {
+      out += '<path d="' + p.d + '" fill="' + ENGRAVE_COLOR + '" stroke="none"/>\n';
     });
     out += '</g>\n';
   }
@@ -759,6 +1107,48 @@ function renderLakeList() {
 }
 
 /* ------------------------------------------------------------
+ * Pins
+ * ---------------------------------------------------------- */
+function addPin() {
+  var D = state.diameter;
+  // tip lands at the coaster center, nudged so consecutive pins don't stack
+  var off = (state.pins.length % 5) * 4;
+  var p = invViewPoint(D / 2 + off, D / 2 + off);
+  var pin = { id: 'pin' + (++pinSeq), px: p[0], py: p[1] };
+  state.pins.push(pin);
+  state.selectedPin = pin.id;
+  renderPinList();
+  render();
+  return pin;
+}
+
+function removePin(id) {
+  state.pins = state.pins.filter(function (p) { return p.id !== id; });
+  if (state.selectedPin === id) state.selectedPin = null;
+  renderPinList();
+  render();
+}
+
+function renderPinList() {
+  var ul = $('pin-list');
+  if (!ul) return;
+  ul.innerHTML = '';
+  state.pins.forEach(function (pin, i) {
+    var li = document.createElement('li');
+    var span = document.createElement('span');
+    span.className = 'lname';
+    span.textContent = 'Pin ' + (i + 1) + ' — drag it onto the spot';
+    var btn = document.createElement('button');
+    btn.title = 'Remove pin';
+    btn.textContent = '✕';
+    btn.addEventListener('click', function () { removePin(pin.id); });
+    li.appendChild(span);
+    li.appendChild(btn);
+    ul.appendChild(li);
+  });
+}
+
+/* ------------------------------------------------------------
  * Nominatim search
  * ---------------------------------------------------------- */
 function regionFromAddress(a) {
@@ -838,8 +1228,16 @@ function setupPointer() {
   }
 
   svg.addEventListener('pointerdown', function (ev) {
-    var t = ev.target.closest ? ev.target.closest('[data-lbl]') : null;
-    if (t) {
+    var tp = ev.target.closest ? ev.target.closest('[data-pin]') : null;
+    var t = !tp && ev.target.closest ? ev.target.closest('[data-lbl]') : null;
+    if (tp) {
+      var pid = tp.getAttribute('data-pin');
+      var pin = state.pins.find(function (p) { return p.id === pid; });
+      if (!pin) return;
+      var mm0 = applyM(viewMatrix(true), [pin.px, pin.py]);
+      drag = { kind: 'pin', id: pid, x: ev.clientX, y: ev.clientY,
+               mx0: mm0[0], my0: mm0[1], moved: false };
+    } else if (t) {
       var id = t.getAttribute('data-lbl');
       var lake = state.lakes.find(function (l) { return l.id === id; });
       if (!lake) return;
@@ -862,6 +1260,14 @@ function setupPointer() {
       state.view.tx = drag.tx0 + dx;
       state.view.ty = drag.ty0 + dy;
       render();
+    } else if (drag.kind === 'pin') {
+      var pin = state.pins.find(function (p) { return p.id === drag.id; });
+      if (pin) {
+        var pr = invViewPoint(drag.mx0 + dx, drag.my0 + dy);
+        pin.px = pr[0];
+        pin.py = pr[1];
+        render();
+      }
     } else {
       var lake = state.lakes.find(function (l) { return l.id === drag.id; });
       if (lake) {
@@ -874,6 +1280,10 @@ function setupPointer() {
 
   svg.addEventListener('pointerup', function (ev) {
     if (drag && drag.kind === 'label' && !drag.moved) openLabelEditor(drag.id);
+    if (drag && drag.kind === 'pin' && !drag.moved) {
+      state.selectedPin = drag.id;
+      render();
+    }
     drag = null;
   });
   svg.addEventListener('pointercancel', function () { drag = null; });
@@ -905,6 +1315,7 @@ function openLabelEditor(id) {
   $('lbl-angle').value = lake.label.angle;
   $('lbl-angle-val').textContent = lake.label.angle + '°';
   $('lbl-visible').checked = lake.label.visible;
+  $('lbl-boxed').checked = !!lake.label.boxed;
   render();
 }
 function closeLabelEditor() {
@@ -1024,6 +1435,46 @@ function bindUI() {
     var lk = selectedLake();
     if (lk) { lk.label.visible = this.checked; render(); }
   });
+  $('lbl-boxed').addEventListener('change', function () {
+    var lk = selectedLake();
+    if (lk) {
+      lk.label.boxed = this.checked;
+      autoPlaceLabel(lk);
+      $('lbl-angle').value = lk.label.angle;
+      $('lbl-angle-val').textContent = lk.label.angle + '°';
+      render();
+    }
+  });
+
+  // streets
+  $('streets-on').addEventListener('change', function () {
+    state.streetOpts.enabled = this.checked;
+    $('streets-body').hidden = !this.checked;
+    if (this.checked && !state.streets.loaded && state.lakes.length) fetchStreets();
+    render();
+  });
+  $('streets-load').addEventListener('click', fetchStreets);
+  ['major', 'main', 'local', 'minor'].forEach(function (cat) {
+    $('st-' + cat).addEventListener('change', function () {
+      state.streetOpts[cat] = this.checked;
+      render();
+    });
+  });
+  $('street-width').addEventListener('input', function () {
+    state.streetOpts.width = parseFloat(this.value);
+    $('street-width-val').textContent = state.streetOpts.width.toFixed(2) + ' mm';
+    render();
+  });
+  $('street-width-val').textContent = '0.20 mm';
+
+  // pins
+  $('pin-add').addEventListener('click', addPin);
+  $('pin-size').addEventListener('input', function () {
+    state.pinSize = parseFloat(this.value);
+    $('pin-size-val').textContent = state.pinSize.toFixed(1) + ' mm';
+    render();
+  });
+  $('pin-size-val').textContent = '4.8 mm';
   $('lbl-auto').addEventListener('click', function () {
     var lk = selectedLake();
     if (lk) {
@@ -1117,6 +1568,20 @@ window.__lakeApp = {
   },
   setFont: function (key) { state.fontKey = key; render(); },
   autoPlaceAll: function () { state.lakes.forEach(autoPlaceLabel); render(); },
+  addPin: addPin,
+  removePin: removePin,
+  // ways: [{highway:'residential', coords:[[lon,lat],...]}] — same pipeline as Overpass
+  setStreetsFromWays: function (ways) {
+    var elements = (ways || []).map(function (w) {
+      return {
+        type: 'way',
+        tags: { highway: w.highway },
+        geometry: w.coords.map(function (c) { return { lon: c[0], lat: c[1] }; })
+      };
+    });
+    applyStreetElements(elements, visibleLonLatBBox(1.06));
+  },
+  fetchStreets: fetchStreets,
   exportSVGString: exportSVGString,
   renderNow: doRender
 };

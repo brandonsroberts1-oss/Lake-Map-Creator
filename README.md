@@ -15,7 +15,19 @@ state curved along the top and the title curved along the bottom.
 - **Curved (arc) text** on top and bottom, with adjustable size and
   letter-spacing, just like the sample coaster.
 - **Small labels next to each lake**, auto-placed along each lake's long axis
-  (PCA) — then drag to move, click to edit text/size/angle.
+  (PCA) — then drag to move, click to edit text/size/angle. Any label can
+  instead be **boxed**: a rounded-corner text box reversed out of the lake
+  fill (an un-engraved window with an engraved border and the name inside),
+  for putting the lake's name *inside* the lake.
+- **Streets around the lake** (optional, for single small lakes): loads real
+  road data from OpenStreetMap Overpass for the visible area, with separate
+  include/exclude toggles for **highways**, **main roads**, **local streets**,
+  and **service roads & paths**, plus a line-width control. Streets are
+  geometrically clipped to the coaster disc and kept out of the arc-text
+  bands (no SVG clip-paths — laser software gets plain pre-cut polylines).
+- **Location pins**: drop one or more classic map pins (tip = the spot) to
+  mark where someone lives, the family cabin, a proposal spot… drag to
+  position; the pin engraves solid with a knocked-out center dot.
 - **Four fonts** (bundled, no internet needed for rendering):
   - *Libre Baskerville* — closest to the sample coaster's engraved serif
   - *EB Garamond* (weight 500) — classic old-style serif
@@ -28,8 +40,9 @@ state curved along the top and the title curved along the bottom.
   - **all text converted to vector paths** — no `<text>` elements, so no
     font-substitution surprises in xTool Creative Space
   - flat structure: no transforms, no clip paths, no CSS, no rasters
-  - color-separated layers: **black fills = engrave**, **red 0.1 mm stroke
-    circle = cut** (easy to select-by-color in XCS/LightBurn)
+  - color-separated layers: **black fills = engrave**, **blue lines =
+    streets** (set to Score, or Engrave for bolder roads), **red 0.1 mm
+    stroke circle = cut** (easy to select-by-color in XCS/LightBurn)
   - polygons simplified to a configurable tolerance and tiny slivers/islands
     filtered, so files stay clean and engrave crisply
   - lakes use `fill-rule="evenodd"` **and** opposite ring winding, so island
@@ -67,10 +80,13 @@ python3 -m http.server 8000
 3. Select the **black** artwork → set processing type **Engrave** (fill). For
    crisp small labels use 250–350 DPI (lines-per-cm equivalent) and test power
    on scrap first.
-4. Select the **red circle** → set to **Cut** if you're cutting your own
+4. If you included streets, select the **blue** lines → set to **Score**
+   (vector engrave) for fine crisp roads, or Engrave with a small power for a
+   softer look.
+5. Select the **red circle** → set to **Cut** if you're cutting your own
    blanks, or **Ignore/delete** it if you're engraving a pre-made coaster (use
    it as a positioning reference before deleting).
-5. Engraving the top face needs **no mirroring**.
+6. Engraving the top face needs **no mirroring**.
 
 Small-text tip: at 3.8″ the lake labels default to ~3 mm — that engraves well
 on hardwood at fine DPI. Below ~2 mm caps the app warns you, because char

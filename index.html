@@ -79,6 +79,7 @@
         <label class="field"><span>Text</span><input type="text" id="lbl-text"></label>
         <label class="field slider-field"><span>Size <b id="lbl-size-val"></b></span><input type="range" id="lbl-size" min="1.5" max="8" step="0.1"></label>
         <label class="field slider-field"><span>Angle <b id="lbl-angle-val"></b></span><input type="range" id="lbl-angle" min="-180" max="180" step="1"></label>
+        <label class="check"><input type="checkbox" id="lbl-boxed"> boxed &mdash; rounded text box inside the lake</label>
         <div class="btn-row">
           <label class="check"><input type="checkbox" id="lbl-visible"> visible</label>
           <button id="lbl-auto" class="btn small">Reset position</button>
@@ -87,8 +88,43 @@
       </div>
     </section>
 
+    <section class="panel" id="panel-streets">
+      <h2>5 &middot; Streets</h2>
+      <label class="check"><input type="checkbox" id="streets-on"> include streets around the lake</label>
+      <div id="streets-body" hidden>
+        <div class="btn-row">
+          <button id="streets-load" class="btn">Load streets for current view</button>
+        </div>
+        <div id="streets-status" class="hint"></div>
+        <div class="check-grid">
+          <label class="check"><input type="checkbox" id="st-major" checked> highways</label>
+          <label class="check"><input type="checkbox" id="st-main" checked> main roads</label>
+          <label class="check"><input type="checkbox" id="st-local" checked> local streets</label>
+          <label class="check"><input type="checkbox" id="st-minor"> service &amp; paths</label>
+        </div>
+        <label class="field slider-field">
+          <span>Street line width <b id="street-width-val"></b></span>
+          <input type="range" id="street-width" min="0.1" max="0.5" step="0.05" value="0.2">
+        </label>
+        <p class="hint">Best for a single small lake. Streets export as a separate <b>blue</b> line layer &mdash; set it to <i>Score</i> in xTool Creative Space (or Engrave for bolder lines). Data &copy; OpenStreetMap via Overpass API.</p>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-pins">
+      <h2>6 &middot; Location pins</h2>
+      <div class="btn-row">
+        <button id="pin-add" class="btn">+ Add pin</button>
+        <label class="field slider-field" style="flex:1;margin:0">
+          <span>Pin size <b id="pin-size-val"></b></span>
+          <input type="range" id="pin-size" min="3" max="9" step="0.1" value="4.8">
+        </label>
+      </div>
+      <ul id="pin-list" class="lake-list"></ul>
+      <p class="hint">Drag a pin onto the home, cabin or memorable spot &mdash; the tip marks the location. Load streets first to find the exact place.</p>
+    </section>
+
     <section class="panel" id="panel-engrave">
-      <h2>5 &middot; Engraving</h2>
+      <h2>7 &middot; Engraving</h2>
       <label class="field num-field">
         <span>Coaster diameter</span>
         <span class="num-wrap"><input type="number" id="diameter" min="40" max="300" step="0.01" value="96.52"> mm</span>

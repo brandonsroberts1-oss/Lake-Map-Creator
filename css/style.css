@@ -130,6 +130,10 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 }
 .check { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--text); cursor: pointer; }
 .check input { accent-color: var(--accent); }
+.check-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; margin: 8px 0; }
+
+#preview .pin-hit { cursor: grab; }
+#preview .pin-hit:active { cursor: grabbing; }
 
 /* ---------- preview ---------- */
 .preview-wrap { position: sticky; top: 14px; display: flex; flex-direction: column; gap: 8px; }

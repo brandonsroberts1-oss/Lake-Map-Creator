@@ -74,7 +74,25 @@ try {
     window.__lakeApp.addLakeFromGeoJSON(west, 'West Lake', 'New York', 'test1');
     window.__lakeApp.addLakeFromGeoJSON(east, 'East Lake', null, 'test2');
     window.__lakeApp.setTexts('New York', 'The Finger Lakes');
+
+    // boxed label inside the wider east lake
+    window.__lakeApp.state.lakes[1].label.boxed = true;
     window.__lakeApp.autoPlaceAll();
+
+    // synthetic street grid: residential + one primary + one service way
+    const ways = [];
+    for (let i = 0; i < 6; i++) {
+      ways.push({ highway: 'residential', coords: [[-77.15 + i * 0.08, 42.45], [-77.15 + i * 0.08, 42.95]] });
+      ways.push({ highway: 'residential', coords: [[-77.3, 42.48 + i * 0.07], [-76.45, 42.48 + i * 0.07]] });
+    }
+    ways.push({ highway: 'primary', coords: [[-77.4, 42.4], [-76.45, 43.0]] });
+    ways.push({ highway: 'service', coords: [[-77.1, 42.55], [-76.8, 42.8]] });
+    window.__lakeApp.state.streetOpts.enabled = true;
+    document.getElementById('streets-on').checked = true;
+    document.getElementById('streets-body').hidden = false;
+    window.__lakeApp.setStreetsFromWays(ways);
+
+    window.__lakeApp.addPin();
     window.__lakeApp.renderNow();
   });
 
@@ -97,7 +115,8 @@ try {
   check('xml declaration', svg.startsWith('<?xml version="1.0"'));
   check('mm width/height', /width="96\.52mm" height="96\.52mm"/.test(svg));
   check('matching viewBox', /viewBox="0 0 96\.52 96\.52"/.test(svg));
-  for (const g of ['ENGRAVE_lakes', 'ENGRAVE_labels', 'ENGRAVE_arc_text', 'CUT_outline']) {
+  for (const g of ['ENGRAVE_lakes', 'ENGRAVE_labels', 'ENGRAVE_arc_text',
+                   'ENGRAVE_pins', 'SCORE_streets', 'CUT_outline']) {
     check(`group ${g}`, svg.includes(`id="${g}"`));
   }
   check('no <text> elements', !/<text[\s>]/.test(svg));
@@ -128,8 +147,50 @@ try {
 
   // island survived as a hole: lakes group should contain a compound path (≥2 subpaths)
   const lakesGroup = svg.match(/<g id="ENGRAVE_lakes">([\s\S]*?)<\/g>/)[1];
-  const compound = [...lakesGroup.matchAll(/ d="([^"]+)"/g)].some(m => (m[1].match(/M/g) || []).length >= 2);
-  check('island preserved as compound path', compound);
+  const lakeSubpaths = [...lakesGroup.matchAll(/ d="([^"]+)"/g)].map(m => (m[1].match(/M/g) || []).length);
+  check('island preserved as compound path', lakeSubpaths[0] >= 2, `subpaths ${lakeSubpaths.join(',')}`);
+  check('boxed label knocks window out of lake', lakeSubpaths[1] >= 2, `subpaths ${lakeSubpaths.join(',')}`);
+
+  // boxed label carries its rounded border band (text contours + 2 rect rings)
+  const labelsGroup = svg.match(/<g id="ENGRAVE_labels">([\s\S]*?)<\/g>/)[1];
+  const labelSubpaths = [...labelsGroup.matchAll(/ d="([^"]+)"/g)].map(m => (m[1].match(/M/g) || []).length);
+  check('boxed label has border band', Math.max(...labelSubpaths) >= 10, `subpaths ${labelSubpaths.join(',')}`);
+
+  // streets: blue score lines, service/paths excluded by default
+  const streetsGroup = svg.match(/<g id="SCORE_streets">([\s\S]*?)<\/g>/)[1];
+  check('streets stroked blue, no fill', /stroke="#0000FF"/.test(streetsGroup) && /fill="none"/.test(streetsGroup));
+  const catIds = [...streetsGroup.matchAll(/id="streets_(\w+)"/g)].map(m => m[1]).sort();
+  check('street categories: major+local only', catIds.join(',') === 'local,major', catIds.join(','));
+
+  // enabling "service & paths" adds the minor category
+  const svgMinor = await page.evaluate(() => {
+    window.__lakeApp.state.streetOpts.minor = true;
+    const s = window.__lakeApp.exportSVGString();
+    window.__lakeApp.state.streetOpts.minor = false;
+    return s;
+  });
+  check('minor toggle adds service ways', /id="streets_minor"/.test(svgMinor));
+
+  // pin: compound path (body + knocked-out dot)
+  const pinsGroup = svg.match(/<g id="ENGRAVE_pins">([\s\S]*?)<\/g>/)[1];
+  const pinSubpaths = (pinsGroup.match(/ d="([^"]+)"/)[1].match(/M/g) || []).length;
+  check('pin has knockout dot', pinSubpaths === 2, `subpaths ${pinSubpaths}`);
+
+  // dragging the pin moves its geographic anchor
+  const pinBefore = await page.evaluate(() => ({ ...window.__lakeApp.state.pins[0] }));
+  {
+    const pv2 = await page.locator('#preview').boundingBox();
+    const D = 96.52, s = 4.8 / 20;
+    const headMMy = D / 2 - 13.5 * s;
+    const px = pv2.x + pv2.width / 2, py = pv2.y + (headMMy / D) * pv2.height;
+    await page.mouse.move(px, py);
+    await page.mouse.down();
+    await page.mouse.move(px + 35, py - 20, { steps: 5 });
+    await page.mouse.up();
+  }
+  const pinAfter = await page.evaluate(() => ({ ...window.__lakeApp.state.pins[0] }));
+  check('pin drag moves anchor', Math.abs(pinAfter.px - pinBefore.px) > 1 &&
+    Math.abs(pinAfter.py - pinBefore.py) > 1);
 
   // ---- robustness: MultiPolygon + dense ring + font switch + pan ----
   const robust = await page.evaluate(() => {
