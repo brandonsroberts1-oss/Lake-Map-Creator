@@ -62,9 +62,10 @@ var state = {
   minIsland: 0.5,           // mm^2 smallest kept island / ring
   woodPreview: true,
   selected: null,           // lake id whose label is being edited
-  scalebar: { on: false, x: null, y: null },
+  scalebar: { on: false, size: 1, inBox: false, x: null, y: null },
   compass: { on: false, size: 16, x: null, y: null },
   infobox: { on: false, scale: 1, x: null, y: null, depth: '', area: '' },
+  snapGrid: false,
   streets: { loaded: false, ways: [], bbox: null }, // ways: {cat, pts[projected]}
   streetOpts: { enabled: false, major: true, main: true, local: true, minor: false, width: 0.2 },
   pins: [],                 // {id, px, py} in projected coords (track the map)
@@ -889,14 +890,23 @@ function pinCmds(h) {
 }
 
 // Straight label centered at (cx,cy), rotated by angleDeg.
-function straightTextD(font, text, size, cx, cy, angleDeg) {
+// boldDelta > 0 synthesizes weight: the glyphs are stamped at 5 sub-offsets
+// merged into one nonzero path — engraves as a single thicker region.
+function straightTextD(font, text, size, cx, cy, angleDeg, boldDelta) {
   if (!text) return '';
   var w = font.getAdvanceWidth(text, size, { kerning: true });
   var cap = capHeightMM(font, size);
   var path = font.getPath(text, -w / 2, cap / 2, size, { kerning: true });
   var r = deg2rad(angleDeg);
   var cos = Math.cos(r), sin = Math.sin(r);
-  return commandsToD(path.commands, [cos, sin, -sin, cos, cx, cy]);
+  var offs = boldDelta > 0
+    ? [[0, 0], [boldDelta, 0], [-boldDelta, 0], [0, boldDelta], [0, -boldDelta]]
+    : [[0, 0]];
+  var d = '';
+  offs.forEach(function (o) {
+    d += commandsToD(path.commands, [cos, sin, -sin, cos, cx + o[0], cy + o[1]]);
+  });
+  return d;
 }
 
 // Layout metrics for a string of glyphs (advances incl. kerning/spacing,
@@ -971,27 +981,24 @@ function groundMetersPerMM() {
   return Math.cos(deg2rad(ll[1])) / s;
 }
 
-// pick a round mile (or feet) length whose bar is ~14–30 mm on the coaster
-function niceScaleBar(mPerMM) {
+// pick a round mile (or feet) value whose bar length is near `target` mm
+function niceScaleBar(mPerMM, target) {
   var MI = 1609.344, FT = 0.3048;
-  var mi = [0.1, 0.2, 0.25, 0.5, 1, 2, 3, 5, 10, 15, 20, 25, 40, 50, 100, 150, 200, 300];
+  var lo = target * 0.6, hi = target * 1.75;
+  var mi = [0.05, 0.1, 0.2, 0.25, 0.5, 1, 1.5, 2, 3, 5, 8, 10, 15, 20, 25, 40,
+            50, 75, 100, 150, 200, 300, 500];
   var best = null;
-  mi.forEach(function (v) {
-    var len = v * MI / mPerMM;
-    if (len < 12 || len > 32) return;
-    if (!best || Math.abs(len - 20) < Math.abs(best.len - 20)) {
-      best = { len: len, label: (v >= 1 ? String(v) : String(v)) + ' mi' };
+  function consider(v, unitLen, unit) {
+    var len = v * unitLen / mPerMM;
+    if (len < lo || len > hi) return;
+    if (!best || Math.abs(len - target) < Math.abs(best.len - target)) {
+      best = { len: len, value: String(v), unit: unit };
     }
-  });
-  if (!best) {
-    [100, 200, 250, 500, 1000, 1500, 2000].forEach(function (v) {
-      var len = v * FT / mPerMM;
-      if (len < 12 || len > 32) return;
-      if (!best || Math.abs(len - 20) < Math.abs(best.len - 20)) {
-        best = { len: len, label: v + ' ft' };
-      }
-    });
   }
+  mi.forEach(function (v) { consider(v, MI, 'mi'); });
+  if (!best) [50, 100, 200, 250, 500, 1000, 1500, 2000, 3000].forEach(function (v) {
+    consider(v, FT, 'ft');
+  });
   return best;
 }
 
@@ -999,22 +1006,59 @@ function rectD(cx, cy, w, h) {
   return commandsToD(roundedRectCmds(w, h, 0, 1), [1, 0, 0, 1, cx, cy]);
 }
 
-function buildScalebarArt(art, font) {
-  if (!state.scalebar.on) return;
+/* ---- snap grid ---- */
+function snapStep() { return state.diameter / 24; }
+function snapMM(v) {
+  if (!state.snapGrid) return v;
+  var g = snapStep();
+  return Math.round(v / g) * g;
+}
+function snapLabelAbs(lake, absx, absy) {
+  var st = lakeStatsMM(lake);
+  var bx = st ? st.cx : absx, by = st ? st.cy : absy;
+  return { dx: snapMM(absx) - bx, dy: snapMM(absy) - by };
+}
+
+// A substantial checkered map scale bar centered at (cx,cy). Returns
+// { d, w, h } (h measured downward from the bar to the labels) or null.
+// sizeMul scales the whole thing; the represented distance grows with it.
+function scaleBarPiece(font, mPerMM, sizeMul, cx, cy) {
+  if (!mPerMM) return null;
+  var target = 18 * sizeMul;
+  var bar = niceScaleBar(mPerMM, target);
+  if (!bar) return null;
+  var u = sizeMul;
+  var len = bar.len, barH = 1.5 * u, band = 0.3 * u;
+  var d = '';
+  // bordered frame (outer ring minus inner ring => picture frame)
+  d += commandsToD(roundedRectCmds(len, barH, 0, 1), [1, 0, 0, 1, cx, cy]);
+  d += commandsToD(roundedRectCmds(len - 2 * band, barH - 2 * band, 0, -1), [1, 0, 0, 1, cx, cy]);
+  // alternating filled cells (classic checkered look)
+  var segs = 4, seg = len / segs;
+  for (var i = 0; i < segs; i += 2) {
+    d += rectD(cx - len / 2 + (i + 0.5) * seg, cy, seg, barH);
+  }
+  // labels below: 0 at the left end, value+unit at the right end (bold)
+  var ts = 1.85 * u, bd = ts * 0.05;
+  var labY = cy + barH / 2 + ts * 0.62 + 0.5 * u;
+  d += straightTextD(font, '0', ts, cx - len / 2, labY, 0, bd);
+  d += straightTextD(font, bar.value + ' ' + bar.unit, ts, cx + len / 2, labY, 0, bd);
+  var topH = barH / 2;
+  var botH = (labY - cy) + ts * 0.6;
+  return { d: d, len: len, w: len + ts * 2.4, top: topH, bottom: botH,
+           h: topH + botH };
+}
+
+function buildScalebarArt(art, font, sbInBox) {
+  if (!state.scalebar.on || sbInBox) return;
   var mPerMM = groundMetersPerMM();
-  if (!mPerMM) return;
-  var bar = niceScaleBar(mPerMM);
-  if (!bar) return;
   var D = state.diameter;
-  var x = state.scalebar.x == null ? D * 0.30 : state.scalebar.x;
-  var y = state.scalebar.y == null ? D * 0.705 : state.scalebar.y;
-  var len = bar.len, bh = 0.42, th = 1.9;
-  var d = rectD(x, y, len, bh) +
-          rectD(x - len / 2 + bh / 2, y - th / 2 + bh / 2, bh, th) +
-          rectD(x + len / 2 - bh / 2, y - th / 2 + bh / 2, bh, th) +
-          rectD(x, y - th * 0.32 + bh / 2, bh * 0.8, th * 0.64) +
-          straightTextD(font, bar.label, 2.3, x, y - th - 1.6, 0);
-  art.scalebar = { d: d, x: x, y: y, hitHW: len / 2 + 2.5, hitHH: 5.5 };
+  var x = state.scalebar.x == null ? D * 0.28 : state.scalebar.x;
+  var y = state.scalebar.y == null ? D * 0.72 : state.scalebar.y;
+  var piece = scaleBarPiece(font, mPerMM, state.scalebar.size, x, y);
+  if (!piece) return;
+  art.scalebar = { d: piece.d, x: x, y: y,
+                   hitHW: piece.w / 2 + 1, hitHH: piece.h / 2 + 1.5 };
 }
 
 // 8-point nautical rose: two overlaid 4-point stars + ring + center dot + N
@@ -1096,31 +1140,67 @@ function formatAreaMi2(a) {
   return s + ' sq mi';
 }
 
-// simple anchor silhouette (height h, centered on 0,0), sampled arcs
+function rectPoly(cx, cy, w, hh) {
+  return [[cx - w / 2, cy - hh / 2], [cx + w / 2, cy - hh / 2],
+          [cx + w / 2, cy + hh / 2], [cx - w / 2, cy + hh / 2]];
+}
+
+// Admiralty anchor silhouette, total height h, centered at (cx,cy).
+// Shank + stock + curved arms with pointed flukes are unioned into one clean
+// outline; the ring is an appended annulus.
 function anchorD(h, cx, cy) {
-  var s = h, d = '';
   var m = [1, 0, 0, 1, cx, cy];
-  // ring at top
-  d += commandsToD(circleCmds(0, -0.40 * s, 0.105 * s, 1), m);
-  d += commandsToD(circleCmds(0, -0.40 * s, 0.058 * s, -1), m);
-  // shank + stock
-  d += rectD(cx, cy - 0.015 * s, 0.06 * s, 0.60 * s);
-  d += rectD(cx, cy - 0.235 * s, 0.40 * s, 0.055 * s);
-  // bottom crescent (half-annulus opening upward), sampled polygon
-  var rO = 0.30 * s, rI = 0.20 * s, a0 = deg2rad(195), a1 = deg2rad(-15), pts = [];
-  for (var i = 0; i <= 16; i++) {
-    var a = a0 + (a1 - a0) * i / 16;
-    pts.push(applyM(m, [rO * Math.cos(a), 0.12 * s - rO * Math.sin(a)]));
+  var d = '';
+  // ring (annulus) at the top
+  d += commandsToD(circleCmds(0, -0.435 * h, 0.10 * h, 1), m);
+  d += commandsToD(circleCmds(0, -0.435 * h, 0.052 * h, -1), m);
+
+  var parts = [];
+  // shank (vertical bar) from just under the ring to the crown
+  parts.push(rectPoly(0, -0.03 * h, 0.058 * h, 0.66 * h));
+  // stock (crossbar) near the top
+  parts.push(rectPoly(0, -0.27 * h, 0.34 * h, 0.05 * h));
+
+  // arms: a downward-bulging crescent (outer arc + inner arc back)
+  var ac = 0.03 * h, rO = 0.32 * h, rI = 0.205 * h;
+  var a0 = 200, a1 = 340, N = 40, cres = [];
+  for (var i = 0; i <= N; i++) {
+    var a = deg2rad(a0 + (a1 - a0) * i / N);
+    cres.push([rO * Math.cos(a), ac - rO * Math.sin(a)]);
   }
-  for (var j = 16; j >= 0; j--) {
-    var b = a0 + (a1 - a0) * j / 16;
-    pts.push(applyM(m, [rI * Math.cos(b), 0.12 * s - rI * Math.sin(b)]));
+  for (var j = N; j >= 0; j--) {
+    var b = deg2rad(a0 + (a1 - a0) * j / N);
+    cres.push([rI * Math.cos(b), ac - rI * Math.sin(b)]);
   }
-  d += polyCmdsD(pts);
+  parts.push(cres);
+  // flukes: triangular barbs pointing up-and-out at each arm end
+  parts.push([[-0.30 * h, 0.145 * h], [-0.375 * h, -0.01 * h], [-0.20 * h, 0.075 * h]]);
+  parts.push([[0.30 * h, 0.145 * h], [0.375 * h, -0.01 * h], [0.20 * h, 0.075 * h]]);
+  // small crown nub at the very bottom
+  parts.push(rectPoly(0, 0.30 * h, 0.11 * h, 0.07 * h));
+
+  d += unionPolysD(parts, m);
   return d;
 }
 
-function buildInfoboxArt(art, windowsByLake, font) {
+// Union a set of simple polygons and emit path data (points pre-transformed
+// by m). Falls back to concatenated fills if the boolean op is unavailable.
+function unionPolysD(polys, m) {
+  var tp = polys.map(function (poly) {
+    return [poly.map(function (p) { return applyM(m, p); })];
+  });
+  if (window.polygonClipping) {
+    try {
+      var u = polygonClipping.union.apply(null, tp);
+      return ringsToPathD(u);
+    } catch (e) { /* fall through */ }
+  }
+  var d = '';
+  tp.forEach(function (poly) { d += polyCmdsD(poly[0]); });
+  return d;
+}
+
+function buildInfoboxArt(art, windowsByLake, font, sbInBox) {
   var ib = state.infobox;
   if (!ib.on || state.lakes.length !== 1) return;
   var lake = state.lakes[0];
@@ -1133,16 +1213,27 @@ function buildInfoboxArt(art, windowsByLake, font) {
   if (ib.depth.trim()) lines.push('Max Depth: ' + ib.depth.trim());
   if (ib.area.trim()) lines.push('Area: ' + ib.area.trim());
 
-  var sName = 2.9 * f, sLine = 2.05 * f;
+  var sName = 3.0 * f, sLine = 2.15 * f;
+  // synthesized bold weight — keeps small engraved serif text legible
+  var bdName = sName * 0.055, bdLine = sLine * 0.05;
   var wMax = font.getAdvanceWidth(name, sName, { kerning: true });
   lines.forEach(function (t) {
     wMax = Math.max(wMax, font.getAdvanceWidth(t, sLine, { kerning: true }));
   });
-  var anchorH = 3.1 * f;
-  var lineGap = sLine * 1.52;
-  var padX = 2.6 * f, padY = 2.0 * f;
+
+  // optional integrated scale bar (sized to the box)
+  var sbPiece = null;
+  if (sbInBox) {
+    sbPiece = scaleBarPiece(font, groundMetersPerMM(), f * 0.92, 0, 0);
+    if (sbPiece) wMax = Math.max(wMax, sbPiece.w);
+  }
+
+  var anchorH = 4.2 * f;
+  var lineGap = sLine * 1.55;
+  var padX = 2.8 * f, padY = 2.2 * f;
   var boxW = wMax + padX * 2;
-  var boxH = padY * 2 + anchorH + 1.2 * f + sName + 0.9 * f + lines.length * lineGap;
+  var boxH = padY * 2 + anchorH + 1.3 * f + sName + 1.0 * f + lines.length * lineGap;
+  if (sbPiece) boxH += 1.6 * f + sbPiece.h;
 
   var D = state.diameter;
   var x = ib.x, y = ib.y;
@@ -1173,13 +1264,18 @@ function buildInfoboxArt(art, windowsByLake, font) {
 
   var cy = -boxH / 2 + padY + anchorH / 2;
   d += anchorD(anchorH, x, y + cy);
-  cy += anchorH / 2 + 1.2 * f + sName / 2;
-  d += straightTextD(font, name, sName, x, y + cy, 0);
-  cy += sName / 2 + 0.9 * f + lineGap / 2;
+  cy += anchorH / 2 + 1.3 * f + sName / 2;
+  d += straightTextD(font, name, sName, x, y + cy, 0, bdName);
+  cy += sName / 2 + 1.0 * f + lineGap / 2;
   lines.forEach(function (t) {
-    d += straightTextD(font, t, sLine, x, y + cy, 0);
+    d += straightTextD(font, t, sLine, x, y + cy, 0, bdLine);
     cy += lineGap;
   });
+  if (sbPiece) {
+    cy += -lineGap / 2 + 1.6 * f + sbPiece.top;
+    var sb = scaleBarPiece(font, groundMetersPerMM(), f * 0.92, x, y + cy);
+    if (sb) d += sb.d;
+  }
 
   // knock the box (plus margin) out of the lake fill if they overlap
   var win = roundedRectPoly(boxW + 1.1, boxH + 1.1, 2.1 * f, m);
@@ -1249,7 +1345,9 @@ function buildArt() {
   });
 
   // info box may add one more window, so build it before the lake fills
-  buildInfoboxArt(art, windowsByLake, font);
+  var sbInBox = state.scalebar.on && state.scalebar.inBox &&
+                state.infobox.on && state.lakes.length === 1;
+  buildInfoboxArt(art, windowsByLake, font, sbInBox);
 
   // pass 2: lake fills with all windows subtracted
   state.lakes.forEach(function (lake) {
@@ -1283,7 +1381,7 @@ function buildArt() {
     if (m2.length) art.warnings.push('Font has no glyph for: ' + m2.join(' '));
   }
 
-  buildScalebarArt(art, font);
+  buildScalebarArt(art, font, sbInBox);
   buildCompassArt(art, font);
 
   // streets go last: they clip around text windows, labels, compass, scale bar
@@ -1350,6 +1448,18 @@ function doRender() {
       s += '<circle cx="' + fmt(c * 0.94) + '" cy="' + fmt(c * 0.9) + '" r="' + fmt(c * i / 4.4) +
            '" fill="none" stroke="#7d5530" stroke-opacity="0.18" stroke-width="0.5"/>';
     }
+  }
+
+  // snap-grid guide dots (preview only)
+  if (state.snapGrid) {
+    var g = snapStep(), gd = '';
+    for (var gx = g; gx < D; gx += g) {
+      for (var gy = g; gy < D; gy += g) {
+        if (Math.hypot(gx - c, gy - c) > c - 1) continue;
+        gd += 'M' + fmt(gx) + ' ' + fmt(gy) + 'm-0.22 0a0.22 0.22 0 1 0 0.44 0a0.22 0.22 0 1 0 -0.44 0Z';
+      }
+    }
+    s += '<path d="' + gd + '" fill="' + (wood ? '#3a2410' : '#3aa0ff') + '" fill-opacity="0.35"/>';
   }
 
   s += '<g id="pv-streets" fill="none" stroke="' + ink + '" stroke-width="' +
@@ -1870,8 +1980,10 @@ function setupPointer() {
       var id = t.getAttribute('data-lbl');
       var lake = state.lakes.find(function (l) { return l.id === id; });
       if (!lake) return;
+      var lst = lakeStatsMM(lake);
       drag = { kind: 'label', id: id, x: ev.clientX, y: ev.clientY,
-               dx0: lake.label.dx, dy0: lake.label.dy, moved: false };
+               cx0: (lst ? lst.cx : 0) + lake.label.dx,
+               cy0: (lst ? lst.cy : 0) + lake.label.dy, moved: false };
     } else if (state.lakes.length) {
       drag = { kind: 'pan', x: ev.clientX, y: ev.clientY,
                tx0: state.view.tx, ty0: state.view.ty };
@@ -1890,13 +2002,13 @@ function setupPointer() {
       state.view.ty = drag.ty0 + dy;
       render();
     } else if (drag.kind === 'extra') {
-      state[drag.which].x = drag.x0 + dx;
-      state[drag.which].y = drag.y0 + dy;
+      state[drag.which].x = snapMM(drag.x0 + dx);
+      state[drag.which].y = snapMM(drag.y0 + dy);
       render();
     } else if (drag.kind === 'pin') {
       var pin = state.pins.find(function (p) { return p.id === drag.id; });
       if (pin) {
-        var pr = invViewPoint(drag.mx0 + dx, drag.my0 + dy);
+        var pr = invViewPoint(snapMM(drag.mx0 + dx), snapMM(drag.my0 + dy));
         pin.px = pr[0];
         pin.py = pr[1];
         render();
@@ -1904,8 +2016,10 @@ function setupPointer() {
     } else {
       var lake = state.lakes.find(function (l) { return l.id === drag.id; });
       if (lake) {
-        lake.label.dx = drag.dx0 + dx;
-        lake.label.dy = drag.dy0 + dy;
+        // snap the label's absolute centre, then store back as an offset
+        var abs = snapLabelAbs(lake, drag.cx0 + dx, drag.cy0 + dy);
+        lake.label.dx = abs.dx;
+        lake.label.dy = abs.dy;
         render();
       }
     }
@@ -2112,6 +2226,21 @@ function bindUI() {
   // extras: scale bar, compass, info box
   $('scalebar-on').addEventListener('change', function () {
     state.scalebar.on = this.checked;
+    $('scalebar-body').hidden = !this.checked;
+    render();
+  });
+  $('scalebar-size').addEventListener('input', function () {
+    state.scalebar.size = parseFloat(this.value);
+    $('scalebar-size-val').textContent = '×' + state.scalebar.size.toFixed(2);
+    render();
+  });
+  $('scalebar-size-val').textContent = '×1.00';
+  $('scalebar-inbox').addEventListener('change', function () {
+    state.scalebar.inBox = this.checked;
+    render();
+  });
+  $('snap-grid').addEventListener('change', function () {
+    state.snapGrid = this.checked;
     render();
   });
   $('compass-on').addEventListener('change', function () {
@@ -2269,7 +2398,8 @@ window.__lakeApp = {
   },
   fetchStreets: fetchStreets,
   exportSVGString: exportSVGString,
-  renderNow: doRender
+  renderNow: doRender,
+  _anchorD: anchorD
 };
 
 })();

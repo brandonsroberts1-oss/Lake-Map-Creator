@@ -139,6 +139,14 @@ try {
   check('depth auto-filled from OSM tag (86 m)', info.depth === '282 ft', info.depth);
   check('area auto-computed', /sq mi$/.test(info.area) && parseFloat(info.area) > 5, info.area);
 
+  // anchor emblem is a clean unioned silhouette (single outer ring + ring hole)
+  const anchor = await page.evaluate(() => {
+    const d = window.__lakeApp._anchorD(20, 0, 0);
+    return { subpaths: (d.match(/M/g) || []).length, len: d.length };
+  });
+  check('anchor emblem builds (unioned outline + ring)', anchor.subpaths >= 3 && anchor.len > 200,
+    `subpaths ${anchor.subpaths}, len ${anchor.len}`);
+
   await page.evaluate(() => window.__lakeApp.renderNow());
   const svg1 = await page.evaluate(() => window.__lakeApp.exportSVGString());
   writeFileSync(join(root, 'docs', 'sample-export.svg'), svg1);
@@ -148,6 +156,65 @@ try {
                    'CUT_outline']) {
     check(`phase1 group ${g}`, svg1.includes(`id="${g}"`));
   }
+
+  // scale bar responds to its size slider (bigger => longer path extent)
+  const sbSizes = await page.evaluate(() => {
+    function ext(svg) {
+      const g = svg.match(/<g id="ENGRAVE_scalebar">([\s\S]*?)<\/g>/);
+      if (!g) return 0;
+      const xs = [...g[1].matchAll(/[ML](-?\d+\.?\d*) /g)].map(m => parseFloat(m[1]));
+      return Math.max(...xs) - Math.min(...xs);
+    }
+    window.__lakeApp.state.scalebar.size = 0.7;
+    const small = ext(window.__lakeApp.exportSVGString());
+    window.__lakeApp.state.scalebar.size = 2.0;
+    const big = ext(window.__lakeApp.exportSVGString());
+    window.__lakeApp.state.scalebar.size = 1;
+    return { small, big };
+  });
+  check('scale bar grows with its size slider', sbSizes.big > sbSizes.small * 1.3,
+    `small ${sbSizes.small.toFixed(1)} -> big ${sbSizes.big.toFixed(1)}`);
+
+  // "integrate into info box": standalone scalebar group disappears, folded in
+  const inbox = await page.evaluate(() => {
+    document.getElementById('scalebar-inbox').checked = true;
+    document.getElementById('scalebar-inbox').dispatchEvent(new Event('change'));
+    return window.__lakeApp.exportSVGString();
+  });
+  check('scalebar in-box removes standalone group', !inbox.includes('ENGRAVE_scalebar'));
+  check('scalebar in-box keeps info box', inbox.includes('ENGRAVE_infobox'));
+  await page.evaluate(() => {
+    document.getElementById('scalebar-inbox').checked = false;
+    document.getElementById('scalebar-inbox').dispatchEvent(new Event('change'));
+  });
+
+  // snap grid quantises a dragged extra to grid multiples
+  const snapped = await page.evaluate(() => {
+    document.getElementById('snap-grid').checked = true;
+    document.getElementById('snap-grid').dispatchEvent(new Event('change'));
+    return true;
+  });
+  {
+    const pv = await page.locator('#preview').boundingBox();
+    const D = 96.52, step = D / 24;
+    const cx = await page.evaluate(() => window.__lakeApp.state.compass.x == null ? 96.52 * 0.76 : window.__lakeApp.state.compass.x);
+    const cy = await page.evaluate(() => window.__lakeApp.state.compass.y == null ? 96.52 * 0.40 : window.__lakeApp.state.compass.y);
+    const sx = pv.x + cx / D * pv.width, sy = pv.y + cy / D * pv.height;
+    await page.mouse.move(sx, sy);
+    await page.mouse.down();
+    await page.mouse.move(sx + 17, sy - 11, { steps: 5 });
+    await page.mouse.up();
+    const pos = await page.evaluate(() => ({ x: window.__lakeApp.state.compass.x, y: window.__lakeApp.state.compass.y }));
+    const onGrid = Math.abs(pos.x / step - Math.round(pos.x / step)) < 1e-6 &&
+                   Math.abs(pos.y / step - Math.round(pos.y / step)) < 1e-6;
+    check('snap grid quantises dragged position', onGrid, `x=${pos.x.toFixed(2)} y=${pos.y.toFixed(2)} step=${step.toFixed(2)}`);
+  }
+  await page.evaluate(() => {
+    document.getElementById('snap-grid').checked = false;
+    document.getElementById('snap-grid').dispatchEvent(new Event('change'));
+    window.__lakeApp.state.compass.x = null;
+    window.__lakeApp.state.compass.y = null;
+  });
 
   // smoothing melts high-frequency shoreline noise: total turning angle of
   // the outer ring must drop well below the unsmoothed version

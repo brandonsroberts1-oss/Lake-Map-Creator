@@ -34,18 +34,28 @@ state curved along the top and the title curved along the bottom.
 - **Location pins**: drop one or more classic map pins (tip = the spot) to
   mark where someone lives, the family cabin, a proposal spot… drag to
   position; the pin engraves solid with a knocked-out center dot.
-- **Scale bar in miles** — true to the map scale (Mercator, cos-latitude
-  corrected), picks a round value (e.g. “5 mi”, or feet for tiny ponds), and
-  stays accurate as you zoom the map. Draggable.
+- **Scale bar in miles** — a substantial checkered (USGS-style) bar with
+  “0” and value labels, true to the map scale (Mercator, cos-latitude
+  corrected), picking a round value (e.g. “5 mi”, or feet for tiny ponds) and
+  staying accurate as you zoom. A **size slider** scales it up or down —
+  bigger settings represent a longer round distance — and you can either
+  leave it free-floating (draggable) or **integrate it into the info box**.
 - **Nautical compass rose** — classic 8-point rose with ring and “N”,
   toggleable with a size slider, draggable, and it rotates with the map so
   north stays true.
-- **Lake info box** (single-lake designs) — a nautical plaque with anchor,
-  double border, and: lake name, state/region, center coordinates, max depth
-  and area in square miles. Area is measured from the actual outline; depth
-  auto-fills from OpenStreetMap tags or Wikidata when available, and both
-  fields are freely editable. Where the plaque overlaps the lake, a clean
-  window is carved out of the fill (true polygon boolean, not a clip-path).
+- **Lake info box** (single-lake designs) — a plaque topped with a proper
+  admiralty **anchor** emblem (built by unioning the shank, stock, arms and
+  flukes into one clean silhouette), double border, and **bold** text for:
+  lake name, state/region, center coordinates, max depth and area in square
+  miles. Text weight is synthesized geometrically so small engraved serif
+  stays crisp (no thin, faint strokes). Area is measured from the actual
+  outline; depth auto-fills from OpenStreetMap tags or Wikidata when
+  available, and both fields are freely editable. Where the plaque overlaps
+  the lake, a clean window is carved out of the fill (true polygon boolean,
+  not a clip-path).
+- **Snap to grid** — an optional toggle; when on, dragging any piece (info
+  box, compass, scale bar, labels, pins) snaps to a grid, with guide dots
+  shown on the preview so alignment is easy. Turn it off for free placement.
 - Streets automatically clip around all text windows, labels, the compass,
   and the scale bar, so nothing engraves on top of anything else.
 - **Four fonts** (bundled, no internet needed for rendering):

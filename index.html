@@ -126,7 +126,16 @@
     <section class="panel" id="panel-extras">
       <h2>7 &middot; Map extras</h2>
 
-      <label class="check"><input type="checkbox" id="scalebar-on"> scale bar (miles) &mdash; true to the map scale</label>
+      <div class="extra-block first">
+        <label class="check"><input type="checkbox" id="scalebar-on"> scale bar (miles) &mdash; true to the map scale</label>
+        <div id="scalebar-body" hidden>
+          <label class="field slider-field">
+            <span>Scale bar size <b id="scalebar-size-val"></b></span>
+            <input type="range" id="scalebar-size" min="0.6" max="2.2" step="0.05" value="1">
+          </label>
+          <label class="check"><input type="checkbox" id="scalebar-inbox"> place it inside the info box</label>
+        </div>
+      </div>
 
       <div class="extra-block">
         <label class="check"><input type="checkbox" id="compass-on"> nautical compass rose</label>
@@ -150,7 +159,11 @@
           <div id="infobox-status" class="hint"></div>
         </div>
       </div>
-      <p class="hint">Scale bar, compass and info box are all draggable on the preview.</p>
+
+      <div class="extra-block">
+        <label class="check"><input type="checkbox" id="snap-grid"> snap to grid when dragging</label>
+      </div>
+      <p class="hint">Scale bar, compass, info box, labels and pins are all draggable on the preview.</p>
     </section>
 
     <section class="panel" id="panel-engrave">
