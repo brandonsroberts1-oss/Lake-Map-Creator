@@ -49,7 +49,25 @@ state curved along the top and the title curved along the bottom.
   lake name, state/region, center coordinates, max depth and area in square
   miles. The bold is a **real bold cut** of the chosen family (never a
   synthesized weight), so every glyph is a single clean contour that engraves
-  once. Area is measured from the actual
+  once.
+
+  Because awkward lake shapes leave awkward gaps, the plaque is fully
+  reshapeable:
+  - **Shape presets** — *Stacked* (upright plaque), *Wide* (title across the
+    top, facts in two columns), *Banner* (short and very long).
+  - **Width / aspect slider** — squeezing it narrower **reflows** the text
+    onto more lines, so the box genuinely becomes tall and skinny (for the
+    gap beside a long lake) rather than just shrinking; widening spreads it
+    out. Columns divide space in proportion to their content, so a short
+    column never forces the long one to wrap.
+  - **Rotation** (±90°) to slot the plaque into a diagonal gap; the whole
+    plaque, including the integrated scale bar, rotates as a unit.
+  - **Field toggles** for the anchor, state, coordinates, depth and area —
+    drop what you don't need and the box shrinks to match.
+  - It never grows past the coaster: if a preset's natural size would
+    overflow, the text scales down to fit.
+
+  Area is measured from the actual
   outline; depth auto-fills from OpenStreetMap tags or Wikidata when
   available, and both fields are freely editable. Where the plaque overlaps
   the lake, a clean window is carved out of the fill (true polygon boolean,

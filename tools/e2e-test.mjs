@@ -181,6 +181,61 @@ try {
     check(`phase1 group ${g}`, svg1.includes(`id="${g}"`));
   }
 
+  // ---- info box shape controls ----
+  const shapes = await page.evaluate(() => {
+    const ib = window.__lakeApp.state.infobox;
+    const saved = { layout: ib.layout, aspect: ib.aspect, rot: ib.rot,
+                    show: Object.assign({}, ib.show) };
+    function box() {
+      const svg = window.__lakeApp.exportSVGString();
+      const g = svg.match(/<g id="ENGRAVE_infobox">([\s\S]*?)<\/g>/);
+      if (!g) return null;
+      const d = g[1].match(/ d="([^"]+)"/)[1];
+      const pts = [...d.matchAll(/(-?\d+\.?\d*) (-?\d+\.?\d*)/g)].map(m => [+m[1], +m[2]]);
+      const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+      return { w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys),
+               x0: Math.min(...xs), y0: Math.min(...ys),
+               x1: Math.max(...xs), y1: Math.max(...ys), d };
+    }
+    function set(cfg) { Object.assign(ib, cfg); return box(); }
+    const stacked = set({ layout: 'stacked', aspect: 1, rot: 0 });
+    const wide = set({ layout: 'wide', aspect: 1, rot: 0 });
+    const banner = set({ layout: 'banner', aspect: 1, rot: 0 });
+    const narrow = set({ layout: 'stacked', aspect: 0.6, rot: 0 });
+    const widened = set({ layout: 'stacked', aspect: 1.8, rot: 0 });
+    const rotated = set({ layout: 'stacked', aspect: 1, rot: 40 });
+    const upright = set({ layout: 'stacked', aspect: 1, rot: 0 });
+    ib.show.depth = false; ib.show.area = false; ib.show.coords = false;
+    const trimmed = box();
+    Object.assign(ib, saved);
+    ib.show = saved.show;
+    return { stacked, wide, banner, narrow, widened, rotated, upright, trimmed };
+  });
+  check('wide layout is wider and shorter than stacked',
+    shapes.wide.w > shapes.stacked.w && shapes.wide.h < shapes.stacked.h,
+    `stacked ${shapes.stacked.w.toFixed(1)}x${shapes.stacked.h.toFixed(1)} vs wide ${shapes.wide.w.toFixed(1)}x${shapes.wide.h.toFixed(1)}`);
+  check('banner layout is the widest, flattest shape',
+    shapes.banner.w / shapes.banner.h > shapes.wide.w / shapes.wide.h,
+    `banner ratio ${(shapes.banner.w / shapes.banner.h).toFixed(2)}`);
+  check('aspect slider narrows the plaque', shapes.narrow.w < shapes.stacked.w * 0.75,
+    `${shapes.stacked.w.toFixed(1)} -> ${shapes.narrow.w.toFixed(1)} mm`);
+  check('narrowing raises the height:width ratio',
+    shapes.narrow.h / shapes.narrow.w > shapes.stacked.h / shapes.stacked.w);
+  check('aspect slider widens the plaque', shapes.widened.w > shapes.stacked.w * 1.4,
+    `${shapes.stacked.w.toFixed(1)} -> ${shapes.widened.w.toFixed(1)} mm`);
+  check('rotation changes the artwork', shapes.rotated.d !== shapes.upright.d);
+  check('rotation tilts the bounding box',
+    shapes.rotated.h > shapes.upright.h * 1.15,
+    `h ${shapes.upright.h.toFixed(1)} -> ${shapes.rotated.h.toFixed(1)} mm at 40°`);
+  check('hiding fields shrinks the plaque', shapes.trimmed.h < shapes.stacked.h * 0.85,
+    `${shapes.stacked.h.toFixed(1)} -> ${shapes.trimmed.h.toFixed(1)} mm`);
+  for (const [nm, b] of Object.entries(shapes)) {
+    if (!b || nm === 'upright') continue;
+    check(`${nm} plaque stays on the coaster`,
+      b.x0 >= -0.6 && b.y0 >= -0.6 && b.x1 <= 97.2 && b.y1 <= 97.2,
+      `${b.x0.toFixed(1)},${b.y0.toFixed(1)} .. ${b.x1.toFixed(1)},${b.y1.toFixed(1)}`);
+  }
+
   // scale bar responds to its size slider (bigger => longer path extent)
   const sbSizes = await page.evaluate(() => {
     function ext(svg) {

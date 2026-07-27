@@ -148,10 +148,33 @@
       <div class="extra-block">
         <label class="check"><input type="checkbox" id="infobox-on"> lake info box (single lake only)</label>
         <div id="infobox-body" hidden>
+          <label class="field">
+            <span>Shape</span>
+            <select id="infobox-layout">
+              <option value="stacked">Stacked &mdash; upright plaque</option>
+              <option value="wide">Wide &mdash; two columns</option>
+              <option value="banner">Banner &mdash; short and long</option>
+            </select>
+          </label>
           <label class="field slider-field">
             <span>Info box size <b id="infobox-scale-val"></b></span>
             <input type="range" id="infobox-scale" min="0.7" max="1.6" step="0.05" value="1">
           </label>
+          <label class="field slider-field">
+            <span>Width / aspect <b id="infobox-aspect-val"></b></span>
+            <input type="range" id="infobox-aspect" min="0.55" max="2.2" step="0.05" value="1">
+          </label>
+          <label class="field slider-field">
+            <span>Rotation <b id="infobox-rot-val"></b></span>
+            <input type="range" id="infobox-rot" min="-90" max="90" step="1" value="0">
+          </label>
+          <div class="check-grid">
+            <label class="check"><input type="checkbox" id="info-show-anchor" checked> anchor</label>
+            <label class="check"><input type="checkbox" id="info-show-region" checked> state</label>
+            <label class="check"><input type="checkbox" id="info-show-coords" checked> coordinates</label>
+            <label class="check"><input type="checkbox" id="info-show-depth" checked> depth</label>
+            <label class="check"><input type="checkbox" id="info-show-area" checked> area</label>
+          </div>
           <label class="field"><span>Max depth (auto-filled when known &mdash; edit freely)</span>
             <input type="text" id="info-depth" placeholder="e.g. 618 ft"></label>
           <label class="field"><span>Area (auto-computed &mdash; edit freely)</span>

@@ -65,7 +65,11 @@ var state = {
   selected: null,           // lake id whose label is being edited
   scalebar: { on: false, size: 1, inBox: false, x: null, y: null },
   compass: { on: false, size: 16, x: null, y: null },
-  infobox: { on: false, scale: 1, x: null, y: null, depth: '', area: '' },
+  infobox: {
+    on: false, scale: 1, aspect: 1, rot: 0, layout: 'stacked',
+    show: { anchor: true, region: true, coords: true, depth: true, area: true },
+    x: null, y: null, depth: '', area: ''
+  },
   snapGrid: false,
   streets: { loaded: false, ways: [], bbox: null }, // ways: {cat, pts[projected]}
   streetOpts: { enabled: false, major: true, main: true, local: true, minor: false, width: 0.2 },
@@ -321,6 +325,19 @@ function viewMatrix(includePan) {
 }
 function applyM(m, p) {
   return [m[0] * p[0] + m[2] * p[1] + m[4], m[1] * p[0] + m[3] * p[1] + m[5]];
+}
+// compose: apply b first, then a
+function matMul(a, b) {
+  return [
+    a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1],
+    a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
+    a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]
+  ];
+}
+function matTranslate(x, y) { return [1, 0, 0, 1, x, y]; }
+function matRotate(deg) {
+  var r = deg2rad(deg);
+  return [Math.cos(r), Math.sin(r), -Math.sin(r), Math.cos(r), 0, 0];
 }
 
 // Describe an arc-text band (annular sector) for collision testing.
@@ -1035,34 +1052,34 @@ function snapLabelAbs(lake, absx, absy) {
   return { dx: snapMM(absx) - bx, dy: snapMM(absy) - by };
 }
 
-// A substantial checkered map scale bar centered at (cx,cy). Returns
-// { d, w, h } (h measured downward from the bar to the labels) or null.
+// A substantial checkered map scale bar, centered at the origin of matrix m
+// and rotated by rotDeg. Returns { d, len, w, top, bottom, h } or null.
 // sizeMul scales the whole thing; the represented distance grows with it.
-function scaleBarPiece(font, mPerMM, sizeMul, cx, cy) {
+function scaleBarPiece(font, mPerMM, sizeMul, m, rotDeg) {
   if (!mPerMM) return null;
-  var target = 18 * sizeMul;
-  var bar = niceScaleBar(mPerMM, target);
+  var bar = niceScaleBar(mPerMM, 18 * sizeMul);
   if (!bar) return null;
-  var u = sizeMul;
+  var u = sizeMul, rot = rotDeg || 0;
   var len = bar.len, barH = 1.5 * u, band = 0.3 * u;
   var d = '';
   // bordered frame (outer ring minus inner ring => picture frame)
-  d += commandsToD(roundedRectCmds(len, barH, 0, 1), [1, 0, 0, 1, cx, cy]);
-  d += commandsToD(roundedRectCmds(len - 2 * band, barH - 2 * band, 0, -1), [1, 0, 0, 1, cx, cy]);
+  d += commandsToD(roundedRectCmds(len, barH, 0, 1), m);
+  d += commandsToD(roundedRectCmds(len - 2 * band, barH - 2 * band, 0, -1), m);
   // alternating filled cells (classic checkered look)
   var segs = 4, seg = len / segs;
   for (var i = 0; i < segs; i += 2) {
-    d += rectD(cx - len / 2 + (i + 0.5) * seg, cy, seg, barH);
+    d += commandsToD(roundedRectCmds(seg, barH, 0, 1),
+      matMul(m, matTranslate(-len / 2 + (i + 0.5) * seg, 0)));
   }
   // labels below: 0 at the left end, value+unit at the right end (bold)
   var ts = 1.85 * u;
-  var labY = cy + barH / 2 + ts * 0.62 + 0.5 * u;
-  d += straightTextD(font, '0', ts, cx - len / 2, labY, 0, true);
-  d += straightTextD(font, bar.value + ' ' + bar.unit, ts, cx + len / 2, labY, 0, true);
-  var topH = barH / 2;
-  var botH = (labY - cy) + ts * 0.6;
-  return { d: d, len: len, w: len + ts * 2.4, top: topH, bottom: botH,
-           h: topH + botH };
+  var labY = barH / 2 + ts * 0.62 + 0.5 * u;
+  var p0 = applyM(m, [-len / 2, labY]);
+  var p1 = applyM(m, [len / 2, labY]);
+  d += straightTextD(font, '0', ts, p0[0], p0[1], rot, true);
+  d += straightTextD(font, bar.value + ' ' + bar.unit, ts, p1[0], p1[1], rot, true);
+  return { d: d, len: len, w: len + ts * 2.4, top: barH / 2,
+           bottom: labY + ts * 0.6, h: barH / 2 + labY + ts * 0.6 };
 }
 
 function buildScalebarArt(art, font, sbInBox) {
@@ -1071,7 +1088,7 @@ function buildScalebarArt(art, font, sbInBox) {
   var D = state.diameter;
   var x = state.scalebar.x == null ? D * 0.28 : state.scalebar.x;
   var y = state.scalebar.y == null ? D * 0.72 : state.scalebar.y;
-  var piece = scaleBarPiece(font, mPerMM, state.scalebar.size, x, y);
+  var piece = scaleBarPiece(font, mPerMM, state.scalebar.size, matTranslate(x, y), 0);
   if (!piece) return;
   art.scalebar = { d: piece.d, x: x, y: y,
                    hitHW: piece.w / 2 + 1, hitHH: piece.h / 2 + 1.5 };
@@ -1161,11 +1178,10 @@ function rectPoly(cx, cy, w, hh) {
           [cx + w / 2, cy + hh / 2], [cx - w / 2, cy + hh / 2]];
 }
 
-// Admiralty anchor silhouette, total height h, centered at (cx,cy).
+// Admiralty anchor silhouette, total height h, placed by matrix m.
 // Shank + stock + curved arms with pointed flukes are unioned into one clean
 // outline; the ring is an appended annulus.
-function anchorD(h, cx, cy) {
-  var m = [1, 0, 0, 1, cx, cy];
+function anchorD(h, m) {
   var d = '';
   // ring (annulus) at the top
   d += commandsToD(circleCmds(0, -0.435 * h, 0.10 * h, 1), m);
@@ -1216,41 +1232,195 @@ function unionPolysD(polys, m) {
   return d;
 }
 
+// Greedy word wrap to maxW (never splits a word; a too-long word gets its
+// own line and the caller shrinks the text if it still overflows).
+function wrapText(font, text, size, maxW) {
+  if (!isFinite(maxW) || maxW <= 0) return [text];
+  var words = String(text).split(/\s+/).filter(Boolean);
+  if (!words.length) return [text];
+  var lines = [], cur = words[0];
+  for (var i = 1; i < words.length; i++) {
+    var trial = cur + ' ' + words[i];
+    if (textWidth(font, trial, size, true) <= maxW) cur = trial;
+    else { lines.push(cur); cur = words[i]; }
+  }
+  lines.push(cur);
+  return lines;
+}
+
+/* Info-box layout.
+ * Lays the plaque out with all text/emblem sizes multiplied by k, reflowing
+ * text to fit availW, and returns the geometry plus a draw() closure — so the
+ * caller can measure naturally, work out the fit, then draw at final size. */
+function infoboxLayout(font, lake, f, layout, facts, name, sbInBox, k, availW) {
+  var fs = f * k;
+  var sName = 3.0 * fs, sLine = 2.15 * fs;
+  var anchorH = 4.2 * fs, lineGap = sLine * 1.55, nameGap = sName * 1.22;
+  var gapA = 1.3 * fs, gapN = 1.0 * fs, colGap = 3.0 * fs;
+  var aw = isFinite(availW) ? availW : Infinity;
+  function wf(t) { return textWidth(font, t, sLine, true); }
+
+  var sb = sbInBox ? scaleBarPiece(font, groundMetersPerMM(), fs * 0.92,
+                                   matTranslate(0, 0), 0) : null;
+
+  // rows: {kind:'anchor'|'name'|'header'|'lines'|'cols'|'sb', ...}
+  var rows = [], contentW = 0;
+  function addRow(r) { rows.push(r); contentW = Math.max(contentW, r.w); }
+  function widest(list, size) {
+    return list.reduce(function (m, t) { return Math.max(m, textWidth(font, t, size, true)); }, 0);
+  }
+
+  if (layout === 'wide' || layout === 'banner') {
+    // anchor sits beside the title instead of above it
+    var aOff = state.infobox.show.anchor ? anchorH * 0.62 + 1.4 * fs : 0;
+    var nameLinesH = wrapText(font, name, sName, aw - aOff);
+    addRow({ kind: 'header', lines: nameLinesH, aOff: aOff,
+             w: widest(nameLinesH, sName) + aOff,
+             h: Math.max(nameLinesH.length * nameGap, state.infobox.show.anchor ? anchorH : 0) });
+  } else {
+    if (state.infobox.show.anchor) addRow({ kind: 'anchor', w: anchorH, h: anchorH });
+    var nameLines = wrapText(font, name, sName, aw);
+    addRow({ kind: 'name', lines: nameLines, w: widest(nameLines, sName),
+             h: nameLines.length * nameGap });
+  }
+
+  if (layout === 'banner') {
+    var joined = facts.join('   ·   ');
+    if (joined) {
+      var bl = wrapText(font, joined, sLine, aw);
+      addRow({ kind: 'lines', lines: bl, w: widest(bl, sLine), h: bl.length * lineGap });
+    }
+  } else if (layout === 'wide') {
+    var half = Math.ceil(facts.length / 2);
+    var factsA = facts.slice(0, half), factsB = facts.slice(half);
+    // split the available width in proportion to each column's natural width,
+    // so a short column never forces the long one to wrap
+    var natA = widest(factsA, sLine), natB = widest(factsB, sLine);
+    var usable = isFinite(aw) ? aw - (factsB.length ? colGap : 0) : Infinity;
+    var wideA = Infinity, wideB = Infinity;
+    if (isFinite(usable) && natA + natB > usable && natA + natB > 0) {
+      wideA = usable * natA / (natA + natB);
+      wideB = usable * natB / (natA + natB);
+    }
+    var colA = [], colB = [];
+    factsA.forEach(function (t) { colA = colA.concat(wrapText(font, t, sLine, wideA)); });
+    factsB.forEach(function (t) { colB = colB.concat(wrapText(font, t, sLine, wideB)); });
+    if (facts.length) {
+      var wA = widest(colA, sLine), wB = widest(colB, sLine);
+      addRow({ kind: 'cols', colA: colA, colB: colB, wA: wA, wB: wB,
+               w: wA + (colB.length ? colGap + wB : 0),
+               h: Math.max(colA.length, colB.length) * lineGap });
+    }
+  } else {
+    facts.forEach(function (t) {
+      var fl = wrapText(font, t, sLine, aw);
+      addRow({ kind: 'lines', lines: fl, w: widest(fl, sLine), h: fl.length * lineGap });
+    });
+  }
+  if (sb) addRow({ kind: 'sb', piece: sb, w: sb.w, h: sb.h + 1.6 * fs });
+
+  // stack heights with the gaps that follow each row kind
+  var contentH = 0;
+  rows.forEach(function (r, i) {
+    contentH += r.h;
+    if (i < rows.length - 1) {
+      contentH += (r.kind === 'anchor') ? gapA : (r.kind === 'name' || r.kind === 'header') ? gapN : 0;
+    }
+  });
+
+  return {
+    fs: fs, contentW: contentW, contentH: contentH, rows: rows,
+    sName: sName, sLine: sLine, anchorH: anchorH, lineGap: lineGap,
+    draw: function (boxM, rot, boxW, boxH) {
+      var d = '', cy = -boxH / 2 + (2.2 * f);
+      function T(text, size, lx, ly, align) {
+        var w = textWidth(font, text, size, true);
+        var ax = align === 'left' ? lx + w / 2 : align === 'right' ? lx - w / 2 : lx;
+        var p = applyM(boxM, [ax, ly]);
+        return straightTextD(font, text, size, p[0], p[1], rot, true);
+      }
+      rows.forEach(function (r, i) {
+        var mid = cy + r.h / 2;
+        if (r.kind === 'anchor') {
+          d += anchorD(anchorH, matMul(boxM, matTranslate(0, mid)));
+        } else if (r.kind === 'name') {
+          r.lines.forEach(function (t, j) {
+            d += T(t, sName, 0, cy + (j + 0.5) * nameGap, 'center');
+          });
+        } else if (r.kind === 'header') {
+          var tx = -r.w / 2 + r.aOff;
+          if (state.infobox.show.anchor) {
+            d += anchorD(anchorH, matMul(boxM, matTranslate(-r.w / 2 + anchorH * 0.31, mid)));
+          }
+          r.lines.forEach(function (t, j) {
+            var ly = mid - (r.lines.length - 1) * nameGap / 2 + j * nameGap;
+            d += r.aOff ? T(t, sName, tx, ly, 'left') : T(t, sName, 0, ly, 'center');
+          });
+        } else if (r.kind === 'lines') {
+          r.lines.forEach(function (t, j) {
+            d += T(t, sLine, 0, cy + (j + 0.5) * lineGap, 'center');
+          });
+        } else if (r.kind === 'cols') {
+          var x0 = -r.w / 2, x1 = x0 + r.wA + colGap;
+          r.colA.forEach(function (t, j) {
+            d += T(t, sLine, x0, cy + (j + 0.5) * lineGap, 'left');
+          });
+          r.colB.forEach(function (t, j) {
+            d += T(t, sLine, x1, cy + (j + 0.5) * lineGap, 'left');
+          });
+        } else if (r.kind === 'sb') {
+          var p2 = scaleBarPiece(font, groundMetersPerMM(), fs * 0.92,
+                                 matMul(boxM, matTranslate(0, cy + 1.6 * fs + r.piece.top)), rot);
+          if (p2) d += p2.d;
+        }
+        cy += r.h;
+        if (i < rows.length - 1) {
+          cy += (r.kind === 'anchor') ? gapA : (r.kind === 'name' || r.kind === 'header') ? gapN : 0;
+        }
+      });
+      return d;
+    }
+  };
+}
+
 function buildInfoboxArt(art, windowsByLake, font, sbInBox) {
   var ib = state.infobox;
   if (!ib.on || state.lakes.length !== 1) return;
   var lake = state.lakes[0];
-  var f = ib.scale;
+  var f = ib.scale, show = ib.show;
   var name = (lake.name || 'Lake').toUpperCase();
-  var lines = [];
-  if (lake.region) lines.push(lake.region);
+  var facts = [];
+  if (show.region && lake.region) facts.push(lake.region);
   var ll = lakeCentroidLL(lake);
-  if (ll) lines.push(formatLatLon(ll));
-  if (ib.depth.trim()) lines.push('Max Depth: ' + ib.depth.trim());
-  if (ib.area.trim()) lines.push('Area: ' + ib.area.trim());
-
-  var sName = 3.0 * f, sLine = 2.15 * f;
-  // real bold cut — keeps small engraved serif text solid and legible
-  var wMax = textWidth(font, name, sName, true);
-  lines.forEach(function (t) {
-    wMax = Math.max(wMax, textWidth(font, t, sLine, true));
-  });
-
-  // optional integrated scale bar (sized to the box)
-  var sbPiece = null;
-  if (sbInBox) {
-    sbPiece = scaleBarPiece(font, groundMetersPerMM(), f * 0.92, 0, 0);
-    if (sbPiece) wMax = Math.max(wMax, sbPiece.w);
-  }
-
-  var anchorH = 4.2 * f;
-  var lineGap = sLine * 1.55;
-  var padX = 2.8 * f, padY = 2.2 * f;
-  var boxW = wMax + padX * 2;
-  var boxH = padY * 2 + anchorH + 1.3 * f + sName + 1.0 * f + lines.length * lineGap;
-  if (sbPiece) boxH += 1.6 * f + sbPiece.h;
+  if (show.coords && ll) facts.push(formatLatLon(ll));
+  if (show.depth && ib.depth.trim()) facts.push('Max Depth: ' + ib.depth.trim());
+  if (show.area && ib.area.trim()) facts.push('Area: ' + ib.area.trim());
 
   var D = state.diameter;
+  var padX = 2.8 * f, padY = 2.2 * f;
+  var maxW = D - 10, maxH = D - 10;
+  var nat = infoboxLayout(font, lake, f, ib.layout, facts, name, sbInBox, 1, Infinity);
+
+  // aspect stretches/squeezes the natural width (never past the coaster);
+  // narrowing reflows the text onto more lines, so the plaque genuinely gets
+  // taller and skinnier instead of just shrinking
+  var boxW = Math.min((nat.contentW + padX * 2) * ib.aspect, maxW);
+  var avail = boxW - padX * 2;
+  var L = infoboxLayout(font, lake, f, ib.layout, facts, name, sbInBox, 1, avail);
+  var k = 1;
+  // a single unbreakable item (or the scale bar) can still overflow — scale it
+  if (L.contentW > avail) {
+    k = Math.max(0.3, avail / L.contentW);
+    L = infoboxLayout(font, lake, f, ib.layout, facts, name, sbInBox, k, avail);
+  }
+  var boxH = L.contentH + padY * 2;
+  if (boxH > maxH) {
+    k *= Math.max(0.3, (maxH - padY * 2) / L.contentH);
+    L = infoboxLayout(font, lake, f, ib.layout, facts, name, sbInBox, k, avail);
+    boxH = L.contentH + padY * 2;
+  }
+  boxW = Math.max(boxW, Math.min(L.contentW + padX * 2, maxW));
+
   var x = ib.x, y = ib.y;
   if (x == null || y == null) {
     // default: the quadrant farthest from the lake body
@@ -1269,34 +1439,22 @@ function buildInfoboxArt(art, windowsByLake, font, sbInBox) {
     y = Math.min(Math.max(best[1], boxH / 2 + 13), D - boxH / 2 - 13);
   }
 
-  var m = [1, 0, 0, 1, x, y];
+  var rot = ib.rot || 0;
+  var boxM = matMul(matTranslate(x, y), matRotate(rot));
   var d = '';
   // double nautical border
-  d += commandsToD(roundedRectCmds(boxW, boxH, 1.8 * f, 1), m);
-  d += commandsToD(roundedRectCmds(boxW - 0.5 * f, boxH - 0.5 * f, 1.55 * f, -1), m);
-  d += commandsToD(roundedRectCmds(boxW - 1.5 * f, boxH - 1.5 * f, 1.2 * f, 1), m);
-  d += commandsToD(roundedRectCmds(boxW - 1.78 * f, boxH - 1.78 * f, 1.06 * f, -1), m);
-
-  var cy = -boxH / 2 + padY + anchorH / 2;
-  d += anchorD(anchorH, x, y + cy);
-  cy += anchorH / 2 + 1.3 * f + sName / 2;
-  d += straightTextD(font, name, sName, x, y + cy, 0, true);
-  cy += sName / 2 + 1.0 * f + lineGap / 2;
-  lines.forEach(function (t) {
-    d += straightTextD(font, t, sLine, x, y + cy, 0, true);
-    cy += lineGap;
-  });
-  if (sbPiece) {
-    cy += -lineGap / 2 + 1.6 * f + sbPiece.top;
-    var sb = scaleBarPiece(font, groundMetersPerMM(), f * 0.92, x, y + cy);
-    if (sb) d += sb.d;
-  }
+  d += commandsToD(roundedRectCmds(boxW, boxH, 1.8 * f, 1), boxM);
+  d += commandsToD(roundedRectCmds(boxW - 0.5 * f, boxH - 0.5 * f, 1.55 * f, -1), boxM);
+  d += commandsToD(roundedRectCmds(boxW - 1.5 * f, boxH - 1.5 * f, 1.2 * f, 1), boxM);
+  d += commandsToD(roundedRectCmds(boxW - 1.78 * f, boxH - 1.78 * f, 1.06 * f, -1), boxM);
+  d += L.draw(boxM, rot, boxW, boxH);
 
   // knock the box (plus margin) out of the lake fill if they overlap
-  var win = roundedRectPoly(boxW + 1.1, boxH + 1.1, 2.1 * f, m);
+  var win = roundedRectPoly(boxW + 1.1, boxH + 1.1, 2.1 * f, boxM);
   (windowsByLake[lake.id] = windowsByLake[lake.id] || []).push(win);
 
-  art.infobox = { d: d, x: x, y: y, hitHW: boxW / 2 + 1, hitHH: boxH / 2 + 1 };
+  art.infobox = { d: d, x: x, y: y, rot: rot,
+                  hitHW: boxW / 2 + 1, hitHH: boxH / 2 + 1 };
 }
 
 /* ------------------------------------------------------------
@@ -1521,9 +1679,10 @@ function doRender() {
   }
   if (art.infobox) {
     s += '<g class="extra-hit" data-extra="infobox"><path d="' + art.infobox.d + '" fill="' + ink + '"/>' +
-         '<rect x="' + fmt(art.infobox.x - art.infobox.hitHW) + '" y="' + fmt(art.infobox.y - art.infobox.hitHH) +
+         '<rect x="' + fmt(-art.infobox.hitHW) + '" y="' + fmt(-art.infobox.hitHH) +
          '" width="' + fmt(art.infobox.hitHW * 2) + '" height="' + fmt(art.infobox.hitHH * 2) +
-         '" fill="rgba(0,0,0,0)"/></g>';
+         '" transform="translate(' + fmt(art.infobox.x) + ' ' + fmt(art.infobox.y) +
+         ') rotate(' + fmt(art.infobox.rot || 0) + ')" fill="rgba(0,0,0,0)"/></g>';
   }
   s += '</g>';
   if (art.cut) {
@@ -2288,6 +2447,28 @@ function bindUI() {
     render();
   });
   $('infobox-scale-val').textContent = '×1.00';
+  $('infobox-layout').addEventListener('change', function () {
+    state.infobox.layout = this.value;
+    render();
+  });
+  $('infobox-aspect').addEventListener('input', function () {
+    state.infobox.aspect = parseFloat(this.value);
+    $('infobox-aspect-val').textContent = '×' + state.infobox.aspect.toFixed(2);
+    render();
+  });
+  $('infobox-aspect-val').textContent = '×1.00';
+  $('infobox-rot').addEventListener('input', function () {
+    state.infobox.rot = parseFloat(this.value);
+    $('infobox-rot-val').textContent = state.infobox.rot + '°';
+    render();
+  });
+  $('infobox-rot-val').textContent = '0°';
+  ['anchor', 'region', 'coords', 'depth', 'area'].forEach(function (fld) {
+    $('info-show-' + fld).addEventListener('change', function () {
+      state.infobox.show[fld] = this.checked;
+      render();
+    });
+  });
   $('info-depth').addEventListener('input', function () {
     state.infobox.depth = this.value;
     render();
@@ -2421,7 +2602,7 @@ window.__lakeApp = {
   fetchStreets: fetchStreets,
   exportSVGString: exportSVGString,
   renderNow: doRender,
-  _anchorD: anchorD,
+  _anchorD: function (h) { return anchorD(h, matTranslate(0, 0)); },
   _textD: function (text, size, bold) {
     return straightTextD(currentFont(), text, size, 0, 0, 0, bold);
   },

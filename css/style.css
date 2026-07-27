@@ -48,6 +48,16 @@ a { color: var(--accent2); }
 .field { display: block; margin: 8px 0; }
 .field > span { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 3px; }
 .field b { color: var(--text); font-weight: 600; }
+select {
+  width: 100%;
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 13.5px;
+}
+select:focus { outline: 1px solid var(--accent); }
 input[type="text"], input[type="number"] {
   width: 100%;
   background: var(--panel2);
