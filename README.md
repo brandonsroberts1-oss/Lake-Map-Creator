@@ -47,8 +47,9 @@ state curved along the top and the title curved along the bottom.
   admiralty **anchor** emblem (built by unioning the shank, stock, arms and
   flukes into one clean silhouette), double border, and **bold** text for:
   lake name, state/region, center coordinates, max depth and area in square
-  miles. Text weight is synthesized geometrically so small engraved serif
-  stays crisp (no thin, faint strokes). Area is measured from the actual
+  miles. The bold is a **real bold cut** of the chosen family (never a
+  synthesized weight), so every glyph is a single clean contour that engraves
+  once. Area is measured from the actual
   outline; depth auto-fills from OpenStreetMap tags or Wikidata when
   available, and both fields are freely editable. Where the plaque overlaps
   the lake, a clean window is carved out of the fill (true polygon boolean,
@@ -129,6 +130,7 @@ index.html          app UI
 css/style.css
 js/app.js           projection, geometry, smoothing, arc-text layout, export
 js/fonts-data.js    bundled fonts (base64 TTF, generated — see fonts/README.md)
+js/fonts-bold-data.js  bold cuts for the info box (subset, generated)
 js/vendor/          opentype.js 1.3.4 (MIT), polygon-clipping 0.15 (MIT)
 fonts/              font licenses (SIL OFL 1.1) + regeneration notes
 tools/e2e-test.mjs  Playwright smoke test of the whole pipeline

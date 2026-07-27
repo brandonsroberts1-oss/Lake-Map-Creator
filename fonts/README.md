@@ -11,8 +11,28 @@ under the **SIL Open Font License 1.1** — full license texts are in this direc
 | EB Garamond | `ofl/ebgaramond/EBGaramond[wght].ttf` | static instance at `wght=500` via `fonttools varLib.instancer` |
 | Montserrat | `ofl/montserrat/Montserrat[wght].ttf` | static instance at `wght=500` via `fonttools varLib.instancer` |
 
-Libre Baskerville and Playfair Display declare Reserved Font Names, so they are
-shipped byte-for-byte unmodified. EB Garamond and Montserrat declare no Reserved
+## Bold cuts (`js/fonts-bold-data.js`)
+
+The info box and scale-bar labels use **real bold outlines**, never a
+synthesized/faked weight — stacking offset copies of a regular glyph produces
+overlapping contours that ghost in xTool Creative Space and double-engrave.
+
+Each family is instanced at `wght=700` and subset to Latin-1 + Latin Extended-A
++ common punctuation (bold is only used for those Latin strings), which keeps
+all four bold cuts to ~120 KB combined. If a lake name contains a character
+outside that subset, the app falls back to the regular weight for that string
+rather than rendering missing glyphs.
+
+```bash
+U="U+0020-007E,U+00A0-00FF,U+0100-017F,U+2013-2014,U+2018-201D,U+2032-2033,U+2212,U+00B0"
+fonttools varLib.instancer -o Family-bold.ttf Family[wght].ttf wght=700
+fonttools subset Family-bold.ttf --unicodes="$U" --layout-features='' \
+  --no-hinting --desubroutinize --output-file=Family-bold-sub.ttf
+# then base64 -w0 each file into the FONT_DATA_BOLD object
+```
+
+Libre Baskerville and Playfair Display declare Reserved Font Names, so the
+regular weights are shipped byte-for-byte unmodified. EB Garamond and Montserrat declare no Reserved
 Font Name; they were instanced to weight 500 because their variable defaults
 (EB Garamond 400, Montserrat **100/Thin**) render too thin for laser engraving —
 `opentype.js` reads only a variable font's default instance.

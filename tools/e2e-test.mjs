@@ -147,6 +147,30 @@ try {
   check('anchor emblem builds (unioned outline + ring)', anchor.subpaths >= 3 && anchor.len > 200,
     `subpaths ${anchor.subpaths}, len ${anchor.len}`);
 
+  // Bold text must use the real bold cut, NOT stacked copies of the regular
+  // glyphs (that ghosted/doubled in xTool and would double-engrave).
+  const boldInfo = await page.evaluate(() => {
+    const s = 'LAKE GEORGE';
+    const reg = window.__lakeApp._textD(s, 3, false);
+    const bold = window.__lakeApp._textD(s, 3, true);
+    const subs = d => (d.match(/M/g) || []).length;
+    return { hasBold: window.__lakeApp._hasBoldFont(), regSubs: subs(reg), boldSubs: subs(bold),
+             differs: reg !== bold };
+  });
+  check('real bold font is bundled', boldInfo.hasBold);
+  check('bold text is a different cut, not the same outlines', boldInfo.differs);
+  check('bold text has no stacked duplicate contours',
+    boldInfo.boldSubs === boldInfo.regSubs,
+    `regular ${boldInfo.regSubs} subpaths vs bold ${boldInfo.boldSubs}`);
+
+  // non-Latin names fall back to the regular weight rather than tofu
+  const fallback = await page.evaluate(() => {
+    const s = 'Байкал';
+    return { d: window.__lakeApp._textD(s, 3, true).length,
+             same: window.__lakeApp._textD(s, 3, true) === window.__lakeApp._textD(s, 3, false) };
+  });
+  check('non-Latin text falls back to regular weight', fallback.same && fallback.d > 0);
+
   await page.evaluate(() => window.__lakeApp.renderNow());
   const svg1 = await page.evaluate(() => window.__lakeApp.exportSVGString());
   writeFileSync(join(root, 'docs', 'sample-export.svg'), svg1);

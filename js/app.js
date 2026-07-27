@@ -42,6 +42,7 @@ var FONT_DEFS = [
 ];
 
 var fonts = {};       // key -> opentype.Font
+var boldFonts = {};   // key -> opentype.Font (real bold instances)
 var fontMetrics = {}; // key -> { capRatio } (cap height / em)
 
 /* ------------------------------------------------------------
@@ -790,8 +791,24 @@ function streetsStale() {
  * ---------------------------------------------------------- */
 function currentFont() { return fonts[state.fontKey]; }
 
+// Real bold companion for the current family, but only if it covers every
+// character in `text` (the bold cuts are subset to Latin). Otherwise the
+// caller falls back to the regular weight — never a synthesized fake bold,
+// which exports as overlapping contours and double-engraves.
+function boldFontFor(text) {
+  var bf = boldFonts[state.fontKey];
+  if (!bf) return null;
+  for (var i = 0; i < text.length; i++) {
+    var ch = text.charAt(i);
+    if (ch === ' ') continue;
+    if (bf.charToGlyphIndex(ch) === 0) return null;
+  }
+  return bf;
+}
+
 function capHeightMM(font, size) {
-  var key = state.fontKey;
+  // cache per actual font object (regular and bold cuts differ slightly)
+  var key = font.__id || state.fontKey;
   if (!fontMetrics[key]) {
     var p = font.getPath('H', 0, 0, 100).getBoundingBox();
     fontMetrics[key] = { capRatio: Math.max(0.5, (-p.y1) / 100) };
@@ -890,23 +907,22 @@ function pinCmds(h) {
 }
 
 // Straight label centered at (cx,cy), rotated by angleDeg.
-// boldDelta > 0 synthesizes weight: the glyphs are stamped at 5 sub-offsets
-// merged into one nonzero path — engraves as a single thicker region.
-function straightTextD(font, text, size, cx, cy, angleDeg, boldDelta) {
+// bold=true swaps in the real bold cut of the family when it covers the text,
+// so each glyph stays a single clean contour (no stacked copies to double-burn).
+function straightTextD(font, text, size, cx, cy, angleDeg, bold) {
   if (!text) return '';
-  var w = font.getAdvanceWidth(text, size, { kerning: true });
-  var cap = capHeightMM(font, size);
-  var path = font.getPath(text, -w / 2, cap / 2, size, { kerning: true });
+  var f = (bold && boldFontFor(text)) || font;
+  var w = f.getAdvanceWidth(text, size, { kerning: true });
+  var cap = capHeightMM(f, size);
+  var path = f.getPath(text, -w / 2, cap / 2, size, { kerning: true });
   var r = deg2rad(angleDeg);
-  var cos = Math.cos(r), sin = Math.sin(r);
-  var offs = boldDelta > 0
-    ? [[0, 0], [boldDelta, 0], [-boldDelta, 0], [0, boldDelta], [0, -boldDelta]]
-    : [[0, 0]];
-  var d = '';
-  offs.forEach(function (o) {
-    d += commandsToD(path.commands, [cos, sin, -sin, cos, cx + o[0], cy + o[1]]);
-  });
-  return d;
+  return commandsToD(path.commands, [Math.cos(r), Math.sin(r), -Math.sin(r), Math.cos(r), cx, cy]);
+}
+
+// Advance width honouring the same regular/bold choice as straightTextD.
+function textWidth(font, text, size, bold) {
+  var f = (bold && boldFontFor(text)) || font;
+  return f.getAdvanceWidth(text, size, { kerning: true });
 }
 
 // Layout metrics for a string of glyphs (advances incl. kerning/spacing,
@@ -1039,10 +1055,10 @@ function scaleBarPiece(font, mPerMM, sizeMul, cx, cy) {
     d += rectD(cx - len / 2 + (i + 0.5) * seg, cy, seg, barH);
   }
   // labels below: 0 at the left end, value+unit at the right end (bold)
-  var ts = 1.85 * u, bd = ts * 0.05;
+  var ts = 1.85 * u;
   var labY = cy + barH / 2 + ts * 0.62 + 0.5 * u;
-  d += straightTextD(font, '0', ts, cx - len / 2, labY, 0, bd);
-  d += straightTextD(font, bar.value + ' ' + bar.unit, ts, cx + len / 2, labY, 0, bd);
+  d += straightTextD(font, '0', ts, cx - len / 2, labY, 0, true);
+  d += straightTextD(font, bar.value + ' ' + bar.unit, ts, cx + len / 2, labY, 0, true);
   var topH = barH / 2;
   var botH = (labY - cy) + ts * 0.6;
   return { d: d, len: len, w: len + ts * 2.4, top: topH, bottom: botH,
@@ -1214,11 +1230,10 @@ function buildInfoboxArt(art, windowsByLake, font, sbInBox) {
   if (ib.area.trim()) lines.push('Area: ' + ib.area.trim());
 
   var sName = 3.0 * f, sLine = 2.15 * f;
-  // synthesized bold weight — keeps small engraved serif text legible
-  var bdName = sName * 0.055, bdLine = sLine * 0.05;
-  var wMax = font.getAdvanceWidth(name, sName, { kerning: true });
+  // real bold cut — keeps small engraved serif text solid and legible
+  var wMax = textWidth(font, name, sName, true);
   lines.forEach(function (t) {
-    wMax = Math.max(wMax, font.getAdvanceWidth(t, sLine, { kerning: true }));
+    wMax = Math.max(wMax, textWidth(font, t, sLine, true));
   });
 
   // optional integrated scale bar (sized to the box)
@@ -1265,10 +1280,10 @@ function buildInfoboxArt(art, windowsByLake, font, sbInBox) {
   var cy = -boxH / 2 + padY + anchorH / 2;
   d += anchorD(anchorH, x, y + cy);
   cy += anchorH / 2 + 1.3 * f + sName / 2;
-  d += straightTextD(font, name, sName, x, y + cy, 0, bdName);
+  d += straightTextD(font, name, sName, x, y + cy, 0, true);
   cy += sName / 2 + 1.0 * f + lineGap / 2;
   lines.forEach(function (t) {
-    d += straightTextD(font, t, sLine, x, y + cy, 0, bdLine);
+    d += straightTextD(font, t, sLine, x, y + cy, 0, true);
     cy += lineGap;
   });
   if (sbPiece) {
@@ -2331,6 +2346,13 @@ function loadFonts() {
       try {
         var buf = b64ToBuffer(window.FONT_DATA[fd.data]);
         fonts[fd.key] = opentype.parse(buf);
+        fonts[fd.key].__id = fd.key;
+        if (window.FONT_DATA_BOLD && window.FONT_DATA_BOLD[fd.data]) {
+          try {
+            boldFonts[fd.key] = opentype.parse(b64ToBuffer(window.FONT_DATA_BOLD[fd.data]));
+            boldFonts[fd.key].__id = fd.key + ':bold';
+          } catch (e2) { /* bold is optional; regular weight still works */ }
+        }
         // register for the UI font picker preview (not used for export)
         if (window.FontFace && document.fonts) {
           var face = new FontFace(fd.name + ' Preview', buf);
@@ -2399,7 +2421,11 @@ window.__lakeApp = {
   fetchStreets: fetchStreets,
   exportSVGString: exportSVGString,
   renderNow: doRender,
-  _anchorD: anchorD
+  _anchorD: anchorD,
+  _textD: function (text, size, bold) {
+    return straightTextD(currentFont(), text, size, 0, 0, 0, bold);
+  },
+  _hasBoldFont: function () { return !!boldFonts[state.fontKey]; }
 };
 
 })();
