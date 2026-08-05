@@ -152,7 +152,28 @@ js/fonts-bold-data.js  bold cuts for the info box (subset, generated)
 js/vendor/          opentype.js 1.3.4 (MIT), polygon-clipping 0.15 (MIT)
 fonts/              font licenses (SIL OFL 1.1) + regeneration notes
 tools/e2e-test.mjs  Playwright smoke test of the whole pipeline
+tools/marketing-render.mjs  annotated 2000×2000 product images -> docs/marketing/
+tools/marketing-lakes.json  real lake outlines (Natural Earth, public domain)
 ```
+
+### Product / listing images
+
+```bash
+node tools/marketing-render.mjs          # all presets
+node tools/marketing-render.mjs tahoe    # one preset
+```
+
+Renders the real app, then overlays callout labels with curved arrows that
+point at whichever feature each callout names (the arrow tip snaps to the
+nearest point on that feature's own outline, so it never sweeps across the
+artwork). Output is 2000×2000 PNG in `docs/marketing/` — Etsy's recommended
+listing size. Edit the `PRESETS` block to change lakes, wording, or which
+features get called out.
+
+The bundled outlines come from [Natural Earth](https://www.naturalearthdata.com/)
+(public domain), so these images carry no attribution requirement. Lakes you
+search inside the app come from OpenStreetMap, which **does** require credit
+if you publish those designs.
 
 ### Development / testing
 
