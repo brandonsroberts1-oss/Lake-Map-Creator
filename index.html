@@ -17,6 +17,16 @@
   <!-- ============ CONTROLS ============ -->
   <aside class="controls">
 
+    <section class="panel" id="panel-project">
+      <h2>Project</h2>
+      <div class="btn-row">
+        <button id="project-save" class="btn">Save project</button>
+        <button id="project-open" class="btn">Open project&hellip;</button>
+        <input type="file" id="project-file" accept=".json,.lakemap,application/json" hidden>
+      </div>
+      <div id="project-status" class="hint">Saves the whole design &mdash; lake shape, snips, text, positions, pins, streets &mdash; to a <code>.lakemap.json</code> file you can reopen later. Ctrl/&#8984;+S saves; you can also drop a project file onto the page.</div>
+    </section>
+
     <section class="panel" id="panel-lakes">
       <h2>1 &middot; Lakes</h2>
       <div class="search-row">
@@ -74,6 +84,14 @@
         <button id="autolabel-btn" class="btn">Auto-place labels</button>
       </div>
       <p class="hint">Drag the map to pan &middot; scroll to zoom &middot; drag labels to move them &middot; click a label to edit it.</p>
+      <div class="snip-block">
+        <div class="btn-row">
+          <button id="snip-btn" class="btn">&#9986; Snip lake</button>
+          <button id="snip-undo" class="btn small" disabled>Undo snip</button>
+          <button id="snip-reset" class="btn small" disabled>Restore full lake</button>
+        </div>
+        <div id="snip-status" class="hint">For very long lakes: cut the lake where the customer wants, remove the parts you don't need, and the section of interest is enlarged to fill the coaster.</div>
+      </div>
       <div id="label-editor" class="label-editor" hidden>
         <h3>Selected label</h3>
         <label class="field"><span>Text</span><input type="text" id="lbl-text"></label>

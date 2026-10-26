@@ -144,6 +144,16 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .extra-block { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
 .extra-block.first { margin-top: 0; padding-top: 0; border-top: none; }
 
+.snip-block { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.btn.active { background: var(--accent); border-color: var(--accent); color: #1c1207; font-weight: 700; }
+.btn:disabled { opacity: .45; cursor: default; }
+.btn:disabled:hover { border-color: var(--line); }
+#panel-project code { font-size: 11.5px; color: var(--text); }
+
+#preview.snipping { cursor: crosshair; }
+#preview .snip-piece { cursor: pointer; }
+#preview .snip-piece:hover { fill-opacity: 0.85; stroke-width: 0.6; }
+
 #preview .extra-hit { cursor: grab; }
 #preview .extra-hit:active { cursor: grabbing; }
 

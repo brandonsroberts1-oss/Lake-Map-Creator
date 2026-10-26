@@ -14,6 +14,22 @@ state curved along the top and the title curved along the bottom.
   lakes are preserved as un-engraved holes. Outlines are fetched at a
   resolution matched to the lake's size (a Great Lake arrives shoreline-
   accurate but manageable; a pond keeps full detail).
+- **Snip long lakes** — for reservoirs that wind on for miles, cut the lake
+  where the customer wants and keep only the section of interest, which is
+  then enlarged to fill the coaster. In snip mode, drag a line across the
+  water to cut it (a true polygon cut, so it only counts if it separates the
+  water from shore to shore); the pieces show in different colours, and a
+  click removes any piece you don't want. Undo, and "Restore full lake", are
+  always available. The info box keeps describing the *whole* lake
+  (coordinates and area), not just the crop.
+
+  ![Snipping Lake Cumberland](docs/snip-demo.png)
+- **Save / open projects** — save the complete working design (lake
+  geometry including snips, all text and settings, positions, pins, loaded
+  streets) to a `.lakemap.json` file and reopen it later exactly as it was —
+  the reopened design exports a byte-identical SVG. Ctrl/⌘+S saves; drop a
+  project file on the page to open it. The page warns before closing with
+  unsaved changes.
 - **Shoreline smoothing** — a proper low-pass filter (uniform resample +
   Gaussian, then simplification), not just point-dropping. Slider up =
   smoother: intricate island fields and fjord-y shorelines melt into the
@@ -115,7 +131,11 @@ python3 -m http.server 8000
    bottom titles any time.
 3. Pick a **font**, tweak arc size/letter-spacing, drag lakes (pan), scroll to
    zoom, drag labels, click a label to edit its text/size/angle.
-4. **Download SVG** and import it into xTool Creative Space.
+4. Lake too long? **✂ Snip lake** (Layout panel): drag a cut across the
+   channel, click the parts you don't want, then **✓ Done**. Shift-drag pans
+   while snipping; Esc cancels a cut you're drawing.
+5. **Save project** to come back to this customer's design later.
+6. **Download SVG** and import it into xTool Creative Space.
 
 > Lake search calls `nominatim.openstreetmap.org` from your browser, so using
 > the app needs internet; fonts and export are fully local.

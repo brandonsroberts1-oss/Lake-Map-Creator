@@ -75,8 +75,11 @@ var state = {
   streetOpts: { enabled: false, major: true, main: true, local: true, minor: false, width: 0.2 },
   pins: [],                 // {id, px, py} in projected coords (track the map)
   pinSize: 4.8,             // mm pin height
-  selectedPin: null
+  selectedPin: null,
+  snip: { on: false, line: null, history: [], dirty: false }
 };
+// pristine copy of the defaults, for filling gaps when opening project files
+var DEFAULTS = JSON.parse(JSON.stringify(state));
 var lakeSeq = 0;
 var pinSeq = 0;
 
@@ -1136,10 +1139,12 @@ function buildCompassArt(art, font) {
   art.compass = { d: d, x: x, y: y, hitR: R + ns * 1.6 };
 }
 
-/* ---- info box (single-lake) ---- */
+/* ---- info box (single-lake) ----
+ * Facts describe the whole lake, so they read the unsnipped outline when the
+ * design shows only a section of it. */
 function lakeCentroidLL(lake) {
   var sx = 0, sy = 0, n = 0;
-  var best = lake.polys.reduce(function (a, p) {
+  var best = (lake.origPolys || lake.polys).reduce(function (a, p) {
     return !a || Math.abs(signedArea(p.outer)) > Math.abs(signedArea(a.outer)) ? p : a;
   }, null);
   if (!best) return null;
@@ -1154,7 +1159,7 @@ function formatLatLon(ll) {
 }
 function lakeAreaMi2(lake) {
   var m2 = 0;
-  lake.polys.forEach(function (p) {
+  (lake.origPolys || lake.polys).forEach(function (p) {
     m2 += Math.abs(signedArea(p.outer));
     p.holes.forEach(function (h) { m2 -= Math.abs(signedArea(h)); });
   });
@@ -1595,6 +1600,8 @@ function buildArt() {
  * ---------------------------------------------------------- */
 var renderQueued = false;
 function render() {
+  // every edit funnels through here, so it doubles as the unsaved-changes flag
+  if (state.lakes.length) projectDirty = true;
   if (renderQueued) return;
   renderQueued = true;
   requestAnimationFrame(function () { renderQueued = false; doRender(); });
@@ -1689,6 +1696,7 @@ function doRender() {
     s += '<path d="' + art.cut + '" fill="none" stroke="' + (wood ? '#00000033' : CUT_COLOR) +
          '" stroke-width="0.3"/>';
   }
+  if (state.snip.on) s += snipOverlaySVG();
   svg.innerHTML = s;
 
   var wEl = $('text-warning');
@@ -1773,20 +1781,28 @@ function exportSVGString() {
   return out;
 }
 
-function downloadSVG() {
-  var svg = exportSVGString();
-  window.__lastExportSVG = svg;
-  var name = (state.bottomText || 'lake-map').toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'lake-map';
-  var blob = new Blob([svg], { type: 'image/svg+xml' });
+function designSlug() {
+  var base = state.bottomText || (state.lakes[0] && state.lakes[0].name) || 'lake-map';
+  return base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'lake-map';
+}
+
+function downloadText(text, type, filename) {
+  var blob = new Blob([text], { type: type });
   var url = URL.createObjectURL(blob);
   var a = document.createElement('a');
   a.href = url;
-  a.download = name + '-coaster.svg';
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 500);
-  $('export-status').textContent = 'Saved ' + a.download + ' — ready for xTool Creative Space.';
+}
+
+function downloadSVG() {
+  var svg = exportSVGString();
+  window.__lastExportSVG = svg;
+  var file = designSlug() + '-coaster.svg';
+  downloadText(svg, 'image/svg+xml', file);
+  $('export-status').textContent = 'Saved ' + file + ' — ready for xTool Creative Space.';
 }
 
 /* ------------------------------------------------------------
@@ -1868,6 +1884,424 @@ function removeLake(id) {
   autofillInfobox();
   render();
   renderLakeList();
+  updateSnipUI();
+}
+
+/* ------------------------------------------------------------
+ * Snip: cut a long lake and keep only the section of interest
+ * ---------------------------------------------------------- */
+var SNIP_KERF_MM = 0.24;  // width of a cut on the coaster at the current zoom
+var SNIP_COLORS = ['#3aa0ff', '#ff8a3a', '#38c172', '#e0457b', '#9b6bff', '#f2c230'];
+
+function clonePolys(polys) {
+  return polys.map(function (p) {
+    return {
+      outer: p.outer.map(function (q) { return [q[0], q[1]]; }),
+      holes: p.holes.map(function (h) { return h.map(function (q) { return [q[0], q[1]]; }); })
+    };
+  });
+}
+
+function snipStatus(msg, isWarn) {
+  var el = $('snip-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = isWarn ? 'warn' : 'hint';
+}
+
+function updateSnipUI() {
+  var b = $('snip-btn');
+  if (!b) return;
+  b.textContent = state.snip.on ? '✓ Done' : '✂ Snip lake';
+  b.classList.toggle('active', state.snip.on);
+  $('snip-undo').disabled = !state.snip.history.length;
+  $('snip-reset').disabled = !state.lakes.some(function (l) { return l.origPolys; });
+  $('preview').classList.toggle('snipping', state.snip.on);
+}
+
+function syncMapScaleUI() {
+  $('map-scale').value = state.view.scaleMul;
+  $('map-scale-val').textContent = '×' + state.view.scaleMul.toFixed(2);
+}
+
+// enlarge whatever water is left to fill the coaster
+function refitToLakes() {
+  state.view.scaleMul = 1;
+  computeFit(true);
+  state.lakes.forEach(autoPlaceLabel);
+  syncMapScaleUI();
+}
+
+function snipPushHistory() {
+  // origPolys is only ever replaced, never mutated, so a reference is safe
+  state.snip.history.push(state.lakes.map(function (l) {
+    return { id: l.id, polys: clonePolys(l.polys), orig: l.origPolys || null };
+  }));
+  if (state.snip.history.length > 40) state.snip.history.shift();
+}
+
+// geometry changed outside snip mode: refit now (otherwise Done will)
+function afterSnipGeometryChange() {
+  state.snip.dirty = true;
+  if (!state.snip.on) { refitToLakes(); state.snip.dirty = false; }
+  updateSnipUI();
+  render();
+}
+
+function setSnipMode(on) {
+  if (on && !state.lakes.length) { snipStatus('Add a lake first.', true); return; }
+  if (state.snip.on === on) return;
+  state.snip.on = on;
+  state.snip.line = null;
+  if (on) {
+    state.selected = null;
+    state.selectedPin = null;
+    $('label-editor').hidden = true;
+    snipStatus('Drag a line across the water where you want to cut. Then click any ' +
+      'coloured piece to remove it. Shift-drag pans, scroll zooms.');
+  } else {
+    if (state.snip.dirty) refitToLakes();
+    snipStatus(state.snip.dirty
+      ? 'Snipped — the remaining section now fills the coaster. Undo or restore any time.'
+      : 'For very long lakes: cut the lake where the customer wants, remove the parts ' +
+        'you don\'t need, and the section of interest is enlarged to fill the coaster.');
+    state.snip.dirty = false;
+  }
+  updateSnipUI();
+  render();
+}
+
+// Cut every lake along segment a→b (coaster mm) with a thin kerf. Only a cut
+// that actually separates water is kept — a nick in the shoreline is ignored.
+function snipCut(a, b) {
+  if (!window.polygonClipping) return false;
+  if (Math.hypot(b[0] - a[0], b[1] - a[1]) < 1.5) {
+    snipStatus('Drag a longer line — all the way across the water.', true);
+    return false;
+  }
+  var pa = invViewPoint(a[0], a[1]), pb = invViewPoint(b[0], b[1]);
+  var half = SNIP_KERF_MM / 2 / (state.view.baseScale * state.view.scaleMul);
+  var dx = pb[0] - pa[0], dy = pb[1] - pa[1], len = Math.hypot(dx, dy);
+  var nx = -dy / len * half, ny = dx / len * half;
+  var cuts = 0;
+  state.lakes.forEach(function (lake) {
+    if (!lake.polys.length) return;
+    // work relative to a local origin: Web-Mercator metres are ~1e7 and the
+    // boolean op is far better conditioned near zero
+    var ox = lake.polys[0].outer[0][0], oy = lake.polys[0].outer[0][1];
+    function ring(r) {
+      var c = r.map(function (q) { return [q[0] - ox, q[1] - oy]; });
+      c.push(c[0].slice());
+      return c;
+    }
+    var subject = lake.polys.map(function (p) { return [ring(p.outer)].concat(p.holes.map(ring)); });
+    var kerf = ring([[pa[0] + nx, pa[1] + ny], [pb[0] + nx, pb[1] + ny],
+                     [pb[0] - nx, pb[1] - ny], [pa[0] - nx, pa[1] - ny]]);
+    var before, out;
+    try {
+      before = polygonClipping.union(subject).length; // normalised piece count
+      out = polygonClipping.difference(subject, [kerf]);
+    } catch (e) { return; }
+    if (out.length <= before) return;
+    if (!cuts) snipPushHistory();
+    if (!lake.origPolys) lake.origPolys = clonePolys(lake.polys);
+    lake.polys = out.map(function (poly) {
+      var rings = poly.map(function (r) {
+        var pts = r.map(function (q) { return [q[0] + ox, q[1] + oy]; });
+        var f = pts[0], l = pts[pts.length - 1];
+        if (pts.length > 1 && f[0] === l[0] && f[1] === l[1]) pts.pop();
+        return pts;
+      });
+      return { outer: rings[0], holes: rings.slice(1) };
+    });
+    delete geomCache[lake.id];
+    cuts++;
+  });
+  if (!cuts) {
+    snipStatus('That line didn\'t separate the lake — drag it all the way across ' +
+      'the water, from shore to shore.', true);
+    render();
+    return false;
+  }
+  snipStatus('Cut! Click the coloured piece you don\'t want to remove it, or cut again.');
+  afterSnipGeometryChange();
+  return true;
+}
+
+function snipRemovePiece(lakeId, idx) {
+  var lake = state.lakes.find(function (l) { return l.id === lakeId; });
+  if (!lake || !lake.polys[idx]) return false;
+  if (lake.polys.length < 2) {
+    snipStatus('That\'s the only piece left of this lake — cut it first, or use ' +
+      'Restore full lake.', true);
+    return false;
+  }
+  snipPushHistory();
+  if (!lake.origPolys) lake.origPolys = clonePolys(lake.polys);
+  lake.polys.splice(idx, 1);
+  delete geomCache[lake.id];
+  snipStatus('Removed. Keep cutting or removing, then click ✓ Done to enlarge what\'s left.');
+  afterSnipGeometryChange();
+  return true;
+}
+
+function snipUndo() {
+  var snap = state.snip.history.pop();
+  if (!snap) return;
+  snap.forEach(function (s) {
+    var lake = state.lakes.find(function (l) { return l.id === s.id; });
+    if (!lake) return;
+    lake.polys = s.polys;
+    lake.origPolys = s.orig;
+    delete geomCache[lake.id];
+  });
+  snipStatus('Undone.');
+  afterSnipGeometryChange();
+}
+
+function snipRestore() {
+  if (!state.lakes.some(function (l) { return l.origPolys; })) return;
+  snipPushHistory(); // restoring is itself undoable
+  state.lakes.forEach(function (lake) {
+    if (!lake.origPolys) return;
+    lake.polys = clonePolys(lake.origPolys);
+    lake.origPolys = null;
+    delete geomCache[lake.id];
+  });
+  snipStatus('Full lake restored.');
+  afterSnipGeometryChange();
+}
+
+// preview overlay: every piece in its own colour so cuts are visible and
+// each piece is clickable
+function snipOverlaySVG() {
+  var vm = viewMatrix(true), s = '<g id="pv-snip">', ci = 0;
+  state.lakes.forEach(function (lake) {
+    lake.polys.forEach(function (poly, i) {
+      var d = '';
+      [poly.outer].concat(poly.holes).forEach(function (ring) {
+        var mm = simplifyRing(ring.map(function (q) { return applyM(vm, q); }), 0.05);
+        mm.forEach(function (q, j) { d += (j ? 'L' : 'M') + fmt(q[0]) + ' ' + fmt(q[1]); });
+        d += 'Z';
+      });
+      var col = SNIP_COLORS[ci++ % SNIP_COLORS.length];
+      s += '<path class="snip-piece" data-piece="' + lake.id + ':' + i + '" d="' + d +
+           '" fill="' + col + '" fill-opacity="0.6" fill-rule="evenodd" stroke="' + col +
+           '" stroke-width="0.3"/>';
+    });
+  });
+  var ln = state.snip.line;
+  if (ln) {
+    s += '<line x1="' + fmt(ln[0][0]) + '" y1="' + fmt(ln[0][1]) + '" x2="' + fmt(ln[1][0]) +
+         '" y2="' + fmt(ln[1][1]) + '" stroke="#e02424" stroke-width="0.45" ' +
+         'stroke-dasharray="1.4 0.9" stroke-linecap="round"/>';
+    ln.forEach(function (q) {
+      s += '<circle cx="' + fmt(q[0]) + '" cy="' + fmt(q[1]) + '" r="0.7" fill="#e02424"/>';
+    });
+  }
+  return s + '</g>';
+}
+
+/* ------------------------------------------------------------
+ * Project save / open — the complete working state, so a customer's
+ * design can be put aside and reopened exactly as it was
+ * ---------------------------------------------------------- */
+var PROJECT_VERSION = 1;
+var projectDirty = false;
+
+function projectStatus(msg, isWarn) {
+  var el = $('project-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = isWarn ? 'warn' : 'hint';
+}
+
+function copyOf(k) { return JSON.parse(JSON.stringify(DEFAULTS[k])); }
+
+var PROJECT_SETTINGS = ['diameter', 'topText', 'bottomText', 'fontKey', 'arcSize', 'arcSpacing',
+  'labelSize', 'cutCircle', 'smoothing', 'minIsland', 'woodPreview', 'snapGrid', 'pinSize'];
+
+function serializeProject() {
+  var settings = {};
+  PROJECT_SETTINGS.forEach(function (k) { settings[k] = state[k]; });
+  // geometry is stored at full precision so a reopened design is identical
+  return {
+    app: 'lake-map-creator',
+    kind: 'project',
+    version: PROJECT_VERSION,
+    savedAt: new Date().toISOString(),
+    settings: settings,
+    view: state.view,
+    lakes: state.lakes.map(function (l) {
+      return {
+        id: l.id, uid: l.uid, name: l.name, region: l.region, extratags: l.extratags,
+        label: l.label, polys: l.polys, origPolys: l.origPolys || null
+      };
+    }),
+    pins: state.pins,
+    streets: state.streets.loaded ? { bbox: state.streets.bbox, ways: state.streets.ways } : null,
+    streetOpts: state.streetOpts,
+    scalebar: state.scalebar,
+    compass: state.compass,
+    infobox: state.infobox
+  };
+}
+
+function saveProject() {
+  if (!state.lakes.length) {
+    projectStatus('Nothing to save yet — add a lake first.', true);
+    return null;
+  }
+  var json = JSON.stringify(serializeProject());
+  var file = designSlug() + '.lakemap.json';
+  downloadText(json, 'application/json', file);
+  projectDirty = false;
+  projectStatus('Saved ' + file + ' (' + Math.max(1, Math.round(json.length / 1024)) +
+    ' KB). Open it any time to pick up exactly where you left off.');
+  return json;
+}
+
+function readPolys(list, what) {
+  if (!Array.isArray(list) || !list.length) throw new Error(what + ' has no outline.');
+  return list.map(function (p) {
+    if (!p || !Array.isArray(p.outer) || p.outer.length < 3) throw new Error(what + ' has a broken outline.');
+    return { outer: p.outer, holes: Array.isArray(p.holes) ? p.holes : [] };
+  });
+}
+
+function seqFrom(ids, prefix) {
+  return ids.reduce(function (m, id) {
+    var n = parseInt(String(id).slice(prefix.length), 10);
+    return isFinite(n) && n > m ? n : m;
+  }, 0);
+}
+
+function applyProject(p) {
+  if (!p || p.app !== 'lake-map-creator' || p.kind !== 'project' || !Array.isArray(p.lakes)) {
+    throw new Error('that file isn\'t a Lake Map Creator project');
+  }
+  // validate everything before touching the current design
+  var lakes = p.lakes.map(function (l, i) {
+    var what = 'Lake “' + (l.name || i + 1) + '”';
+    return {
+      id: String(l.id || 'lk' + (i + 1)), uid: l.uid || null,
+      name: l.name || 'Lake', region: l.region || '', extratags: l.extratags || null,
+      polys: readPolys(l.polys, what),
+      origPolys: l.origPolys ? readPolys(l.origPolys, what) : null,
+      label: Object.assign({ text: l.name || 'Lake', dx: 0, dy: 0, angle: 0, size: null,
+                             visible: true }, l.label)
+    };
+  });
+
+  state.snip = copyOf('snip');
+  state.selected = null;
+  state.selectedPin = null;
+  $('label-editor').hidden = true;
+
+  var st = p.settings || {};
+  PROJECT_SETTINGS.forEach(function (k) {
+    state[k] = st[k] !== undefined ? st[k] : DEFAULTS[k];
+  });
+  if (!fonts[state.fontKey]) state.fontKey = DEFAULTS.fontKey;
+  state.lakes = lakes;
+  state.view = Object.assign(copyOf('view'), p.view);
+  state.pins = (p.pins || []).filter(function (q) { return q && isFinite(q.px) && isFinite(q.py); })
+    .map(function (q, i) { return { id: String(q.id || 'pin' + (i + 1)), px: q.px, py: q.py }; });
+  state.streets = p.streets && Array.isArray(p.streets.ways)
+    ? { loaded: true, ways: p.streets.ways, bbox: p.streets.bbox || null }
+    : copyOf('streets');
+  state.streetOpts = Object.assign(copyOf('streetOpts'), p.streetOpts);
+  state.scalebar = Object.assign(copyOf('scalebar'), p.scalebar);
+  state.compass = Object.assign(copyOf('compass'), p.compass);
+  var ib = p.infobox || {};
+  state.infobox = Object.assign(copyOf('infobox'), ib);
+  state.infobox.show = Object.assign(copyOf('infobox').show, ib.show);
+
+  lakeSeq = seqFrom(lakes.map(function (l) { return l.id; }), 'lk');
+  pinSeq = seqFrom(state.pins.map(function (q) { return q.id; }), 'pin');
+  geomCache = {};
+
+  syncUI();
+  buildFontList();
+  renderLakeList();
+  renderPinList();
+  updateSnipUI();
+  render();
+  projectDirty = false;
+  return (p.version || 0) > PROJECT_VERSION
+    ? 'This project was saved by a newer version of the app; anything it doesn\'t know about was skipped.'
+    : '';
+}
+
+function openProjectFile(file) {
+  if (projectDirty && state.lakes.length &&
+      !window.confirm('Open “' + file.name + '”? Unsaved changes to the current design will be lost.')) {
+    return;
+  }
+  var reader = new FileReader();
+  reader.onload = function () {
+    try {
+      var note = applyProject(JSON.parse(reader.result));
+      projectStatus('Opened ' + file.name + '.' + (note ? ' ' + note : ''), !!note);
+    } catch (e) {
+      projectStatus('Couldn\'t open ' + file.name + ': ' + (e.message || e) + '.', true);
+    }
+  };
+  reader.onerror = function () { projectStatus('Couldn\'t read ' + file.name + '.', true); };
+  reader.readAsText(file);
+}
+
+// push every control to match state (after opening a project)
+function syncUI() {
+  function val(id, v) { var e = $(id); if (e) e.value = v; }
+  function chk(id, v) { var e = $(id); if (e) e.checked = !!v; }
+  function txt(id, t) { var e = $(id); if (e) e.textContent = t; }
+  function show(id, on) { var e = $(id); if (e) e.hidden = !on; }
+  var D = state.diameter, so = state.streetOpts, ib = state.infobox;
+
+  val('top-text', state.topText);
+  val('bottom-text', state.bottomText);
+  val('arc-size', state.arcSize); txt('arc-size-val', state.arcSize.toFixed(1) + ' mm');
+  val('arc-spacing', state.arcSpacing); txt('arc-spacing-val', state.arcSpacing.toFixed(2) + ' em');
+  val('label-size', state.labelSize); txt('label-size-val', state.labelSize.toFixed(1) + ' mm');
+  val('smoothing', state.smoothing); txt('smoothing-val', Math.round(state.smoothing * 100) + '%');
+  val('min-island', state.minIsland); txt('island-val', state.minIsland.toFixed(1) + ' mm²');
+  syncMapScaleUI();
+  val('map-rot', state.view.rotDeg); txt('map-rot-val', state.view.rotDeg + '°');
+  val('diameter', D);
+  txt('diameter-in', '= ' + (D / 25.4).toFixed(2) + '″');
+  txt('preview-size-note', (D / 25.4).toFixed(2) + '″ (' + D.toFixed(2) + ' mm) round coaster');
+  chk('cut-circle', state.cutCircle);
+  chk('wood-style', state.woodPreview);
+
+  chk('streets-on', so.enabled); show('streets-body', so.enabled);
+  ['major', 'main', 'local', 'minor'].forEach(function (c) { chk('st-' + c, so[c]); });
+  val('street-width', so.width); txt('street-width-val', so.width.toFixed(2) + ' mm');
+  streetStatus(state.streets.loaded
+    ? state.streets.ways.length + ' street segments (saved with the project).' : '');
+
+  val('pin-size', state.pinSize); txt('pin-size-val', state.pinSize.toFixed(1) + ' mm');
+
+  chk('scalebar-on', state.scalebar.on); show('scalebar-body', state.scalebar.on);
+  val('scalebar-size', state.scalebar.size);
+  txt('scalebar-size-val', '×' + state.scalebar.size.toFixed(2));
+  chk('scalebar-inbox', state.scalebar.inBox);
+  chk('snap-grid', state.snapGrid);
+  chk('compass-on', state.compass.on); show('compass-size-row', state.compass.on);
+  val('compass-size', state.compass.size);
+  txt('compass-size-val', state.compass.size.toFixed(0) + ' mm');
+
+  chk('infobox-on', ib.on); show('infobox-body', ib.on);
+  val('infobox-layout', ib.layout);
+  val('infobox-scale', ib.scale); txt('infobox-scale-val', '×' + ib.scale.toFixed(2));
+  val('infobox-aspect', ib.aspect); txt('infobox-aspect-val', '×' + ib.aspect.toFixed(2));
+  val('infobox-rot', ib.rot); txt('infobox-rot-val', ib.rot + '°');
+  ['anchor', 'region', 'coords', 'depth', 'area'].forEach(function (f) {
+    chk('info-show-' + f, ib.show[f]);
+  });
+  val('info-depth', ib.depth);
+  val('info-area', ib.area);
+  infoStatus('');
 }
 
 function renderLakeList() {
@@ -2132,8 +2566,26 @@ function setupPointer() {
     var r = svg.getBoundingClientRect();
     return state.diameter / r.width;
   }
+  function toMM(ev) {
+    var r = svg.getBoundingClientRect(), k = state.diameter / r.width;
+    return [(ev.clientX - r.left) * k, (ev.clientY - r.top) * k];
+  }
 
   svg.addEventListener('pointerdown', function (ev) {
+    // snip mode: drag draws a cut, a click removes a piece, Shift-drag pans
+    if (state.snip.on) {
+      if (ev.button === 0 && !ev.shiftKey) {
+        var pc = ev.target.closest ? ev.target.closest('[data-piece]') : null;
+        drag = { kind: 'cut', x: ev.clientX, y: ev.clientY, a: toMM(ev),
+                 piece: pc && pc.getAttribute('data-piece'), moved: false };
+      } else {
+        drag = { kind: 'pan', x: ev.clientX, y: ev.clientY,
+                 tx0: state.view.tx, ty0: state.view.ty };
+      }
+      svg.setPointerCapture(ev.pointerId);
+      ev.preventDefault();
+      return;
+    }
     var tx = ev.target.closest ? ev.target.closest('[data-extra]') : null;
     var tp = !tx && ev.target.closest ? ev.target.closest('[data-pin]') : null;
     var t = !tx && !tp && ev.target.closest ? ev.target.closest('[data-lbl]') : null;
@@ -2171,7 +2623,9 @@ function setupPointer() {
     var k = mmPerPx();
     var dx = (ev.clientX - drag.x) * k, dy = (ev.clientY - drag.y) * k;
     if (Math.abs(ev.clientX - drag.x) + Math.abs(ev.clientY - drag.y) > 3) drag.moved = true;
-    if (drag.kind === 'pan') {
+    if (drag.kind === 'cut') {
+      if (drag.moved) { state.snip.line = [drag.a, toMM(ev)]; render(); }
+    } else if (drag.kind === 'pan') {
       state.view.tx = drag.tx0 + dx;
       state.view.ty = drag.ty0 + dy;
       render();
@@ -2200,6 +2654,17 @@ function setupPointer() {
   });
 
   svg.addEventListener('pointerup', function (ev) {
+    if (drag && drag.kind === 'cut') {
+      var d = drag;
+      drag = null;
+      state.snip.line = null;
+      if (d.moved) snipCut(d.a, toMM(ev));
+      else if (d.piece) {
+        var sep = d.piece.lastIndexOf(':');
+        snipRemovePiece(d.piece.slice(0, sep), parseInt(d.piece.slice(sep + 1), 10));
+      } else render();
+      return;
+    }
     if (drag && drag.kind === 'label' && !drag.moved) openLabelEditor(drag.id);
     if (drag && drag.kind === 'pin' && !drag.moved) {
       state.selectedPin = drag.id;
@@ -2207,7 +2672,18 @@ function setupPointer() {
     }
     drag = null;
   });
-  svg.addEventListener('pointercancel', function () { drag = null; });
+  svg.addEventListener('pointercancel', function () {
+    drag = null;
+    if (state.snip.line) { state.snip.line = null; render(); }
+  });
+  // Esc abandons a cut that's still being drawn
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape' && drag && drag.kind === 'cut') {
+      drag = null;
+      state.snip.line = null;
+      render();
+    }
+  });
 
   svg.addEventListener('wheel', function (ev) {
     if (!state.lakes.length) return;
@@ -2488,6 +2964,44 @@ function bindUI() {
   });
   $('lbl-close').addEventListener('click', closeLabelEditor);
 
+  // snip
+  $('snip-btn').addEventListener('click', function () { setSnipMode(!state.snip.on); });
+  $('snip-undo').addEventListener('click', snipUndo);
+  $('snip-reset').addEventListener('click', snipRestore);
+
+  // project save / open
+  $('project-save').addEventListener('click', saveProject);
+  $('project-open').addEventListener('click', function () { $('project-file').click(); });
+  $('project-file').addEventListener('change', function () {
+    if (this.files && this.files[0]) openProjectFile(this.files[0]);
+    this.value = ''; // let the same file be chosen again
+  });
+  document.addEventListener('keydown', function (ev) {
+    if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && ev.key.toLowerCase() === 's') {
+      ev.preventDefault();
+      saveProject();
+    }
+  });
+  function hasFiles(ev) {
+    return ev.dataTransfer && Array.prototype.indexOf.call(ev.dataTransfer.types || [], 'Files') >= 0;
+  }
+  document.addEventListener('dragover', function (ev) {
+    if (hasFiles(ev)) ev.preventDefault();
+  });
+  document.addEventListener('drop', function (ev) {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();
+    var f = ev.dataTransfer.files[0];
+    if (f && /\.(json|lakemap)$/i.test(f.name)) openProjectFile(f);
+    else if (f) projectStatus('Drop a .lakemap.json project file to open it.', true);
+  });
+  window.addEventListener('beforeunload', function (ev) {
+    if (projectDirty && state.lakes.length) {
+      ev.preventDefault();
+      ev.returnValue = '';
+    }
+  });
+
   $('export-btn').addEventListener('click', downloadSVG);
 }
 
@@ -2567,6 +3081,15 @@ window.__lakeApp = {
   state: state,
   addLakeFromGeoJSON: addLakeFromGeoJSON,
   removeLake: removeLake,
+  setSnipMode: setSnipMode,
+  snipCut: snipCut,
+  snipRemovePiece: snipRemovePiece,
+  snipUndo: snipUndo,
+  snipRestore: snipRestore,
+  projectJSON: function () { return JSON.stringify(serializeProject()); },
+  openProjectJSON: function (s) { return applyProject(JSON.parse(s)); },
+  isDirty: function () { return projectDirty; },
+  lonLatToMM: function (lon, lat) { return applyM(viewMatrix(true), project(lon, lat)); },
   setTexts: function (top, bottom) {
     state.topText = top || '';
     state.bottomText = bottom || '';

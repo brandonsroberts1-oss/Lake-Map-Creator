@@ -5,7 +5,7 @@
  */
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -490,6 +490,268 @@ try {
   const svgEl = page.locator('svg');
   await svgEl.screenshot({ path: join(root, 'docs', 'export-render.png') });
   check('export renders standalone', await svgEl.count() === 1);
+
+  /* ================= PHASE 3: snipping a long lake ================= */
+  const p3 = await browser.newPage({ viewport: { width: 1500, height: 980 } });
+  p3.on('pageerror', e => errors.push(String(e)));
+  p3.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
+  p3.on('dialog', d => d.accept());
+  await p3.goto(`http://localhost:${PORT}/`, { waitUntil: 'load' });
+  await p3.evaluate(() => window.__lakeApp.ready);
+
+  // a 30 km meandering reservoir, ~0.4 km wide — the Paintsville problem
+  const river = await p3.evaluate(() => {
+    const lat0 = 37.85, lon0 = -83.0, N = 400, lenKm = 30;
+    const kmLat = 110.574, kmLon = 111.32 * Math.cos(lat0 * Math.PI / 180);
+    const c = [];
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      c.push([t * lenKm, 2.2 * Math.sin(t * Math.PI * 5) + 0.5 * Math.sin(t * Math.PI * 13 + 1)]);
+    }
+    const left = [], right = [];
+    for (let i = 0; i <= N; i++) {
+      const a = c[Math.max(0, i - 1)], b = c[Math.min(N, i + 1)];
+      let tx = b[0] - a[0], ty = b[1] - a[1];
+      const l = Math.hypot(tx, ty); tx /= l; ty /= l;
+      const w = 0.18 * (1 + 0.5 * Math.sin(i * 0.3));
+      left.push([c[i][0] - ty * w, c[i][1] + tx * w]);
+      right.push([c[i][0] + ty * w, c[i][1] - tx * w]);
+    }
+    const ll = ([x, y]) => [lon0 + x / kmLon, lat0 + y / kmLat];
+    const ring = left.concat(right.reverse()).map(ll);
+    ring.push(ring[0].slice());
+    window.__river = c.map(ll);
+    window.__lakeApp.addLakeFromGeoJSON({ type: 'Polygon', coordinates: [ring] },
+      'Long Lake', 'Kentucky', 'river1');
+    window.__lakeApp.setTexts('', 'Long Lake, Kentucky');
+    window.__lakeApp.renderNow();
+    return { points: ring.length };
+  });
+
+  const lakeExtent = async (pg) => pg.evaluate(() => {
+    const svg = window.__lakeApp.exportSVGString();
+    const d = svg.match(/<g id="ENGRAVE_lakes">[\s\S]*?d="([^"]+)"/)[1];
+    const pts = [...d.matchAll(/(-?\d+\.?\d*) (-?\d+\.?\d*)/g)].map(m => [+m[1], +m[2]]);
+    const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+    return { w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys),
+             x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+  });
+  const fullExtent = await lakeExtent(p3);
+
+  // info box area before snipping, for comparison later
+  await p3.check('#infobox-on');
+  const areaFull = await p3.inputValue('#info-area');
+
+  await p3.click('#snip-btn');
+  // the preview redraws on the next animation frame
+  const snipOn = await p3.waitForFunction(() =>
+    window.__lakeApp.state.snip.on && document.querySelectorAll('#pv-snip .snip-piece').length === 1,
+    null, { timeout: 5000 }).then(() => true, () => false);
+  check('snip mode turns on', snipOn);
+
+  const pv3 = await p3.locator('#preview').boundingBox();
+  const D = 96.52;
+  const toScreen = (q) => [pv3.x + q[0] / D * pv3.width, pv3.y + q[1] / D * pv3.height];
+  // perpendicular cut across the channel at index i of the centreline
+  const cutAt = (i) => p3.evaluate((i) => {
+    const r = window.__river, app = window.__lakeApp;
+    const c = app.lonLatToMM(...r[i]), c0 = app.lonLatToMM(...r[i - 1]), c1 = app.lonLatToMM(...r[i + 1]);
+    let tx = c1[0] - c0[0], ty = c1[1] - c0[1];
+    const l = Math.hypot(tx, ty); tx /= l; ty /= l;
+    return [[c[0] - ty * 5, c[1] + tx * 5], [c[0] + ty * 5, c[1] - tx * 5]];
+  }, i);
+  const onRiver = (i) => p3.evaluate((i) => window.__lakeApp.lonLatToMM(...window.__river[i]), i);
+  async function drag(a, b) {
+    const s = toScreen(a), e = toScreen(b);
+    await p3.mouse.move(s[0], s[1]);
+    await p3.mouse.down();
+    await p3.mouse.move(e[0], e[1], { steps: 8 });
+    await p3.mouse.up();
+    await p3.evaluate(() => window.__lakeApp.renderNow());
+  }
+  async function clickMM(q) {
+    const s = toScreen(q);
+    await p3.mouse.click(s[0], s[1]);
+    await p3.evaluate(() => window.__lakeApp.renderNow());
+  }
+  const pieces = () => p3.evaluate(() => window.__lakeApp.state.lakes[0].polys.length);
+
+  // a line through dry land must not change anything
+  await drag([D * 0.5, D * 0.12], [D * 0.56, D * 0.16]);
+  check('cut that misses the water is rejected', await pieces() === 1 &&
+    await p3.evaluate(() => document.getElementById('snip-status').className === 'warn'));
+
+  // real cut across the channel, 60% of the way along
+  const [ca, cb] = await cutAt(240);
+  await drag(ca, cb);
+  check('cut across the channel splits the lake in two', await pieces() === 2, `pieces ${await pieces()}`);
+  check('both pieces shown as clickable overlays',
+    await p3.evaluate(() => document.querySelectorAll('#pv-snip .snip-piece').length === 2));
+
+  // click the upstream piece to remove it
+  await clickMM(await onRiver(60));
+  check('clicking a piece removes it', await pieces() === 1, `pieces ${await pieces()}`);
+  const hits = await p3.evaluate(([gone, kept]) => {
+    const pv = document.getElementById('preview').getBoundingClientRect(), D = 96.52;
+    const at = (q) => document.elementFromPoint(pv.left + q[0] / D * pv.width, pv.top + q[1] / D * pv.height);
+    return {
+      gone: !!(at(gone) && at(gone).closest('.snip-piece')),
+      kept: !!(at(kept) && at(kept).closest('.snip-piece'))
+    };
+  }, [await onRiver(60), await onRiver(350)]);
+  check('the clicked section is gone, the section of interest stays', !hits.gone && hits.kept,
+    JSON.stringify(hits));
+
+  // the last piece can't be removed by accident
+  await clickMM(await onRiver(350));
+  check('last remaining piece is protected', await pieces() === 1);
+
+  await p3.click('#snip-btn'); // Done
+  const snipExtent = await lakeExtent(p3);
+  check('Done exits snip mode', await p3.waitForFunction(() =>
+    !window.__lakeApp.state.snip.on && !document.getElementById('pv-snip'),
+    null, { timeout: 5000 }).then(() => true, () => false));
+  check('remaining section is enlarged to fill the coaster',
+    Math.max(snipExtent.w, snipExtent.h) > Math.max(fullExtent.w, fullExtent.h) * 0.9 &&
+    snipExtent.w * snipExtent.h > fullExtent.w * fullExtent.h * 1.5,
+    `full ${fullExtent.w.toFixed(1)}x${fullExtent.h.toFixed(1)} -> ` +
+    `snipped ${snipExtent.w.toFixed(1)}x${snipExtent.h.toFixed(1)} mm`);
+  check('snipped lake stays on the board', snipExtent.x0 >= 0 && snipExtent.y0 >= 0 &&
+    snipExtent.x1 <= D && snipExtent.y1 <= D);
+
+  // info box still describes the whole lake, not the crop
+  await p3.fill('#info-area', '');
+  await p3.uncheck('#infobox-on');
+  await p3.check('#infobox-on');
+  check('info box area still describes the whole lake',
+    await p3.inputValue('#info-area') === areaFull, `${areaFull} vs ${await p3.inputValue('#info-area')}`);
+
+  check('undo + restore become available', await p3.evaluate(() =>
+    !document.getElementById('snip-undo').disabled && !document.getElementById('snip-reset').disabled));
+  await p3.click('#snip-undo');
+  await p3.evaluate(() => window.__lakeApp.renderNow());
+  check('undo brings the removed piece back', await pieces() === 2);
+  const undoExtent = await lakeExtent(p3);
+  check('undo outside snip mode re-fits onto the board',
+    undoExtent.x0 >= 0 && undoExtent.y0 >= 0 && undoExtent.x1 <= D && undoExtent.y1 <= D);
+  await p3.click('#snip-reset');
+  await p3.evaluate(() => window.__lakeApp.renderNow());
+  check('restore full lake returns the original outline', await p3.evaluate((n) => {
+    const l = window.__lakeApp.state.lakes[0];
+    return l.polys.length === 1 && !l.origPolys && l.polys[0].outer.length === n - 1;
+  }, river.points));
+  await p3.click('#snip-undo');  // restore is undoable too
+  check('restore is itself undoable', await pieces() === 2);
+
+  // snip again for the save/load round trip: keep the downstream section
+  await p3.click('#snip-btn');
+  await p3.evaluate(() => window.__lakeApp.renderNow());
+  await clickMM(await onRiver(60));
+  await p3.click('#snip-btn');
+
+  /* ================= PHASE 4: save / open project ================= */
+  await p3.evaluate(() => {
+    const app = window.__lakeApp;
+    app.setTexts('Kentucky', 'Paintsville Lake');
+    const rot = document.getElementById('map-rot');
+    rot.value = '-25'; rot.dispatchEvent(new Event('input'));
+    document.querySelector('.font-option[data-font="garamond"]').click();
+    const pin = app.addPin();
+    app.movePinMM(pin.id, 30, 40);
+    app.state.selectedPin = null;
+  });
+  await p3.check('#compass-on');
+  await p3.check('#scalebar-on');
+  await p3.check('#scalebar-inbox');
+  await p3.selectOption('#infobox-layout', 'wide');
+  await p3.evaluate(() => window.__lakeApp.renderNow());
+  const svgBefore = await p3.evaluate(() => window.__lakeApp.exportSVGString());
+  check('design is marked unsaved', await p3.evaluate(() => window.__lakeApp.isDirty()));
+
+  const [dl] = await Promise.all([p3.waitForEvent('download'), p3.click('#project-save')]);
+  check('save produces a .lakemap.json file', /\.lakemap\.json$/.test(dl.suggestedFilename()),
+    dl.suggestedFilename());
+  const savedPath = join(root, 'docs', '.tmp-project.lakemap.json');
+  await dl.saveAs(savedPath);
+  const saved = JSON.parse(readFileSync(savedPath, 'utf8'));
+  check('project file is tagged and versioned', saved.app === 'lake-map-creator' &&
+    saved.kind === 'project' && saved.version === 1);
+  check('project keeps both the snipped and the original outline',
+    saved.lakes[0].polys.length === 1 && Array.isArray(saved.lakes[0].origPolys));
+  check('saving clears the unsaved flag', !(await p3.evaluate(() => window.__lakeApp.isDirty())));
+
+  const [dl2] = await Promise.all([p3.waitForEvent('download'), p3.keyboard.press('Control+s')]);
+  check('Ctrl+S saves the project', /\.lakemap\.json$/.test(dl2.suggestedFilename()));
+
+  // fresh session, then open the file through the real file picker
+  const p4 = await browser.newPage({ viewport: { width: 1500, height: 980 } });
+  p4.on('pageerror', e => errors.push(String(e)));
+  p4.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
+  p4.on('dialog', d => d.accept());
+  await p4.goto(`http://localhost:${PORT}/`, { waitUntil: 'load' });
+  await p4.evaluate(() => window.__lakeApp.ready);
+  await p4.setInputFiles('#project-file', savedPath);
+  await p4.waitForFunction(() => /Opened/.test(document.getElementById('project-status').textContent),
+    null, { timeout: 10000 });
+  await p4.evaluate(() => window.__lakeApp.renderNow());
+  const svgAfter = await p4.evaluate(() => window.__lakeApp.exportSVGString());
+  check('reopened project exports a byte-identical SVG', svgAfter === svgBefore,
+    `lengths ${svgBefore.length} vs ${svgAfter.length}`);
+  const ui = await p4.evaluate(() => ({
+    top: document.getElementById('top-text').value,
+    rot: document.getElementById('map-rot-val').textContent,
+    font: document.querySelector('.font-option.active').getAttribute('data-font'),
+    compass: document.getElementById('compass-on').checked,
+    inbox: document.getElementById('scalebar-inbox').checked,
+    layout: document.getElementById('infobox-layout').value,
+    infoBody: !document.getElementById('infobox-body').hidden,
+    restore: !document.getElementById('snip-reset').disabled,
+    lakeList: document.querySelectorAll('#lake-list li').length,
+    pinList: document.querySelectorAll('#pin-list li').length,
+    dirty: window.__lakeApp.isDirty()
+  }));
+  check('controls reflect the reopened project',
+    ui.top === 'Kentucky' && ui.rot === '-25°' && ui.font === 'garamond' && ui.compass &&
+    ui.inbox && ui.layout === 'wide' && ui.infoBody && ui.lakeList === 1 && ui.pinList === 1,
+    JSON.stringify(ui));
+  check('snip can still be restored after reopening', ui.restore);
+  check('freshly opened project is not marked unsaved', !ui.dirty);
+
+  // a new lake added after reopening must not collide with saved ids
+  const ids = await p4.evaluate(() => {
+    const app = window.__lakeApp;
+    app.addLakeFromGeoJSON({ type: 'Polygon', coordinates: [[[-83.2, 37.7], [-83.19, 37.7],
+      [-83.19, 37.71], [-83.2, 37.71], [-83.2, 37.7]]] }, 'Pond', null, 'pond');
+    const p = app.addPin();
+    return { lakes: app.state.lakes.map(l => l.id), pins: app.state.pins.map(q => q.id) };
+  });
+  check('ids stay unique after reopening',
+    new Set(ids.lakes).size === ids.lakes.length && new Set(ids.pins).size === ids.pins.length,
+    JSON.stringify(ids));
+
+  // a file that isn't a project is refused and leaves the design untouched
+  const beforeBad = await p4.evaluate(() => window.__lakeApp.state.lakes.length);
+  await p4.setInputFiles('#project-file', {
+    name: 'notes.json', mimeType: 'application/json', buffer: Buffer.from('{"hello":1}')
+  });
+  await p4.waitForFunction(() => /Couldn/.test(document.getElementById('project-status').textContent),
+    null, { timeout: 10000 });
+  check('non-project file is refused without damage',
+    await p4.evaluate((n) => window.__lakeApp.state.lakes.length === n &&
+      document.getElementById('project-status').className === 'warn', beforeBad));
+
+  // older/partial project files fill in defaults instead of breaking
+  const partial = await p4.evaluate((s) => {
+    const p = JSON.parse(s);
+    delete p.infobox.show; delete p.compass; delete p.settings.smoothing;
+    window.__lakeApp.openProjectJSON(JSON.stringify(p));
+    const st = window.__lakeApp.state;
+    return { anchor: st.infobox.show.anchor, compassSize: st.compass.size, smoothing: st.smoothing };
+  }, readFileSync(savedPath, 'utf8'));
+  check('partial project files fall back to defaults',
+    partial.anchor === true && partial.compassSize === 16 && partial.smoothing === 0.6,
+    JSON.stringify(partial));
+  unlinkSync(savedPath);
 
   check('no page errors', errors.length === 0, errors.join(' | ').slice(0, 500));
 
